@@ -37,6 +37,8 @@ Pepsi-SAXS.
   are validated against ProDy's reference 1UBI Hessian and eigenvalues.
 - **Mass-weighting is opt-in** (`Params::mass_weighted`); eigenvalues are then
   squared frequencies `ω²`.
+- **Rigid blocks are opt-in** (`NormalModes::with_blocks`): the Rotation-Translation
+  Blocks reduction used by Pepsi-SAXS/NOLB, validated against ProDy's reference.
 
 ## Scope
 

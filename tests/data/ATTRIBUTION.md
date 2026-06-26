@@ -8,6 +8,9 @@ ANM implementation.
 - `anm1ubi_hessian.coo` — reference ANM Hessian (cutoff 15 Å, γ = 1), sparse COO,
   1-indexed `i j value`, symmetric (only one triangle stored).
 - `anm1ubi_evalues.dat` — reference ANM eigenvalues (lowest 36), `index value`.
+- `2gb1_truncated.pdb` — 28-residue Cα model with RTB block ids in the beta column.
+- `rtb2gb1_hessian.coo` — reference RTB-reduced Hessian (`Pᵀ H P`, cutoff 15 Å, γ = 1),
+  sparse COO, 1-indexed `i j value`, symmetric.
 
 ProDy is distributed under the MIT License:
 

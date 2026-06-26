@@ -67,3 +67,34 @@ scope for this library.
 
 If per-residue RTB is wanted in the future, the right reference oracle is
 ProDy's own `RTB` class (it ships `rtb2gb1` fixtures), not the Pepsi binary.
+
+## RTB is now implemented — and the oracle is ProDy, not the binary
+
+`NormalModes::with_blocks` adds the per-residue RTB reduction. It is validated by
+`tests/prody_rtb.rs`: the eigenvalue spectrum of our reduced Hessian `Pᵀ H P`
+matches ProDy's reference `rtb2gb1_hessian.coo` exactly. Spectra are compared
+(not the matrices) because a block's rotational basis is only defined up to
+orientation, so `Pᵀ H P` is basis-dependent while its eigenvalues are not.
+
+### Why not assert against the NOLB binary directly
+
+NOLB (`~/Downloads/NOLB`, the authentic Grudinin engine Pepsi wraps) *can*
+generate RTB fixtures — it is ARPACK-based (lowest-k, confirmed), takes a rigid
+block file (`--blocks`, new format `chain:start:end` intervals, e.g. `A1:8`), and
+emits frequencies as JSON (`-j`, under `["Doing NMA"]["Frequencies"]["value"]`).
+For crambin it gives a clean run (`-n 10 -c 5`):
+
+```
+0.006593 0.006788 0.008845 0.009876 0.010521 0.011923 0.012043 0.013044 0.013821 0.013881
+```
+
+But an *exact* cross-check is brittle, because matching NOLB means matching every
+one of its engine conventions, several of them surprising:
+- it reads **742 atoms** for crambin (it keeps hydrogens; Pepsi kept 327);
+- it reports a **null-space of 2**, not the textbook 6;
+- its own mass set and frequency definition (`√λ` up to an unknown constant).
+
+A scale-invariant comparison doesn't rescue this, since relative frequency
+spacing depends on those mass/hydrogen choices. So NOLB confirms the *model* we
+implemented and is recorded here as a reference, but the committed assertion uses
+ProDy's exact, self-contained `rtb2gb1` fixtures.

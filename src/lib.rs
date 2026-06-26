@@ -40,6 +40,9 @@
 mod eigen;
 mod hessian;
 mod network;
+mod rtb;
+
+use nalgebra::DMatrix;
 
 /// A point mass in the elastic network.
 ///
@@ -91,6 +94,13 @@ pub enum Error {
     /// A coordinate was not finite, or mass-weighting was requested with a
     /// non-positive or non-finite mass (which has no real square root).
     NotFinite,
+    /// The block list passed to [`NormalModes::with_blocks`] did not have one
+    /// entry per atom.
+    BlockCountMismatch,
+    /// A multi-atom block is rank-deficient (collinear or coincident atoms), so
+    /// it has no well-defined rotational basis. Use a single-atom block, or
+    /// blocks of three or more non-collinear atoms.
+    DegenerateBlock,
 }
 
 impl std::fmt::Display for Error {
@@ -98,6 +108,8 @@ impl std::fmt::Display for Error {
         match self {
             Self::TooFewAtoms => write!(f, "at least two atoms are required"),
             Self::NotFinite => write!(f, "non-finite coordinate or mass"),
+            Self::BlockCountMismatch => write!(f, "blocks must have one entry per atom"),
+            Self::DegenerateBlock => write!(f, "a multi-atom block is collinear or coincident"),
         }
     }
 }
@@ -129,6 +141,39 @@ const ZERO_EIGENVALUE: f64 = 1e-6;
 /// rescale the result regardless.
 const BOLTZMANN_KCAL_PER_MOL_K: f64 = 1.987_204_259e-3;
 
+/// Shared validation: returns per-atom positions and the per-atom weights used
+/// by the Hessian and any block projection (atomic masses when mass-weighting,
+/// otherwise unit).
+fn validated_inputs(atoms: &[Atom], params: &Params) -> Result<(Vec<[f64; 3]>, Vec<f64>), Error> {
+    if atoms.len() < 2 {
+        return Err(Error::TooFewAtoms);
+    }
+    let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
+    if positions.iter().flatten().any(|x| !x.is_finite()) {
+        return Err(Error::NotFinite);
+    }
+    if params.mass_weighted && atoms.iter().any(|a| !(a.mass.is_finite() && a.mass > 0.0)) {
+        return Err(Error::NotFinite);
+    }
+    let weights = if params.mass_weighted {
+        atoms.iter().map(|a| a.mass).collect()
+    } else {
+        vec![1.0; atoms.len()]
+    };
+    Ok((positions, weights))
+}
+
+/// Assemble the all-atom ANM Hessian, mass-weighted when requested. `weights`
+/// equals the atomic masses on the mass-weighted path and is otherwise unused.
+fn build_hessian(positions: &[[f64; 3]], weights: &[f64], params: &Params) -> DMatrix<f64> {
+    let contacts = network::contacts(positions, params.cutoff);
+    let mut h = hessian::build(positions.len(), params.gamma, &contacts);
+    if params.mass_weighted {
+        hessian::mass_weight(&mut h, weights);
+    }
+    h
+}
+
 impl NormalModes {
     /// Build the ANM Hessian for `atoms` and diagonalize it.
     ///
@@ -137,37 +182,60 @@ impl NormalModes {
     /// constructors of the numeric ecosystem it builds on (nalgebra's
     /// `SymmetricEigen::new`, and `Regex::new`).
     pub fn new(atoms: &[Atom], params: &Params) -> Result<Self, Error> {
-        if atoms.len() < 2 {
-            return Err(Error::TooFewAtoms);
-        }
-
-        let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
-        if positions.iter().flatten().any(|x| !x.is_finite()) {
-            return Err(Error::NotFinite);
-        }
-        if params.mass_weighted && atoms.iter().any(|a| !(a.mass.is_finite() && a.mass > 0.0)) {
-            return Err(Error::NotFinite);
-        }
-
-        let contacts = network::contacts(&positions, params.cutoff);
-        let mut h = hessian::build(atoms.len(), params.gamma, &contacts);
-        if params.mass_weighted {
-            let masses: Vec<f64> = atoms.iter().map(|a| a.mass).collect();
-            hessian::mass_weight(&mut h, &masses);
-        }
+        let (positions, weights) = validated_inputs(atoms, params)?;
+        let h = build_hessian(&positions, &weights, params);
 
         let spectrum = eigen::solve(h);
-        let n_atoms = atoms.len();
-        let mut modes = Vec::with_capacity(spectrum.eigenvalues.len() * n_atoms);
-        for col in spectrum.eigenvectors.column_iter() {
+        Ok(Self::from_modes(
+            spectrum.eigenvalues,
+            &spectrum.eigenvectors,
+            atoms.len(),
+        ))
+    }
+
+    /// Group atoms into rigid blocks (the Rotation-Translation Blocks method)
+    /// and solve the reduced eigenproblem.
+    ///
+    /// `blocks` gives one block id per atom (parallel to `atoms`); ids need not
+    /// be contiguous. Each block keeps six rigid degrees of freedom — three if
+    /// it is a single atom — so the problem shrinks to `nb6 ≤ 6·n_blocks`
+    /// coordinates. The returned modes are the same per-atom displacement fields
+    /// as [`new`](Self::new), lifted back from the reduced space.
+    ///
+    /// This is the model used by Pepsi-SAXS / NOLB. With every atom in its own
+    /// block it reduces exactly to [`new`](Self::new).
+    pub fn with_blocks(atoms: &[Atom], blocks: &[usize], params: &Params) -> Result<Self, Error> {
+        if blocks.len() != atoms.len() {
+            return Err(Error::BlockCountMismatch);
+        }
+        let (positions, weights) = validated_inputs(atoms, params)?;
+        let h = build_hessian(&positions, &weights, params);
+
+        // Reduce to the block subspace, solve there, then lift modes back with P.
+        // `tr_mul` forms Pᵀ·(H·P) without materializing the transpose of P.
+        let p = rtb::projection(&positions, &weights, blocks)?;
+        let reduced = p.tr_mul(&(&h * &p));
+        let spectrum = eigen::solve(reduced);
+        let all_atom = &p * spectrum.eigenvectors;
+        Ok(Self::from_modes(
+            spectrum.eigenvalues,
+            &all_atom,
+            atoms.len(),
+        ))
+    }
+
+    /// Repackage an eigendecomposition (columns = modes, rows = `3·n_atoms`
+    /// Cartesian coordinates) into the flattened per-atom mode storage.
+    fn from_modes(eigenvalues: Vec<f64>, vectors: &DMatrix<f64>, n_atoms: usize) -> Self {
+        let mut modes = Vec::with_capacity(eigenvalues.len() * n_atoms);
+        for col in vectors.column_iter() {
             modes.extend((0..n_atoms).map(|a| [col[3 * a], col[3 * a + 1], col[3 * a + 2]]));
         }
-
-        Ok(Self {
-            eigenvalues: spectrum.eigenvalues,
+        Self {
+            eigenvalues,
             modes,
             n_atoms,
-        })
+        }
     }
 
     /// Number of modes, equal to three times the atom count.
@@ -360,5 +428,119 @@ mod tests {
                 epsilon = 1e-9
             );
         }
+    }
+
+    // --- RTB (Rotation-Translation Blocks) ---
+
+    /// A connected, non-collinear six-atom cluster; any three of its atoms are
+    /// non-collinear, so it is safe to carve into multi-atom blocks.
+    fn cluster6() -> Vec<Atom> {
+        [
+            (0.0, 0.0, 0.0),
+            (1.2, 0.0, 0.0),
+            (0.0, 1.2, 0.0),
+            (0.0, 0.0, 1.2),
+            (1.2, 1.2, 0.0),
+            (1.0, 0.5, 1.0),
+        ]
+        .iter()
+        .map(|&(x, y, z)| carbon(x, y, z))
+        .collect()
+    }
+
+    fn rtb_params() -> Params {
+        Params {
+            cutoff: 5.0,
+            ..Params::default()
+        }
+    }
+
+    /// Each atom in its own block ⇒ the projection is the identity, so RTB must
+    /// reproduce the plain ANM spectrum exactly. Ties RTB to the ProDy-validated path.
+    #[test]
+    fn all_singleton_blocks_match_plain_anm() {
+        let atoms = cluster6();
+        let blocks: Vec<usize> = (0..atoms.len()).collect();
+
+        let plain = NormalModes::new(&atoms, &rtb_params()).unwrap();
+        let rtb = NormalModes::with_blocks(&atoms, &blocks, &rtb_params()).unwrap();
+
+        assert_eq!(rtb.len(), plain.len());
+        for (a, b) in rtb.eigenvalues().iter().zip(plain.eigenvalues()) {
+            assert_relative_eq!(a, b, epsilon = 1e-9);
+        }
+    }
+
+    /// Only the grouping matters, not the id values: relabeling the blocks
+    /// leaves the spectrum unchanged.
+    #[test]
+    fn block_id_values_are_remapped() {
+        let atoms = cluster6();
+        let a = NormalModes::with_blocks(&atoms, &[0, 0, 0, 1, 1, 1], &rtb_params()).unwrap();
+        let b = NormalModes::with_blocks(&atoms, &[42, 42, 42, 7, 7, 7], &rtb_params()).unwrap();
+        for (x, y) in a.eigenvalues().iter().zip(b.eigenvalues()) {
+            assert_relative_eq!(x, y, epsilon = 1e-12);
+        }
+    }
+
+    /// Blocks are grouped by id regardless of atom order: interleaved ids put
+    /// non-adjacent atoms in the same block and still yield two 6-DOF blocks.
+    #[test]
+    fn interleaved_blocks_are_grouped_by_id() {
+        let atoms = cluster6();
+        let modes = NormalModes::with_blocks(&atoms, &[0, 1, 0, 1, 0, 1], &rtb_params()).unwrap();
+        assert_eq!(modes.len(), 12); // two non-singleton blocks, 6 DOF each
+        let zeros = modes
+            .eigenvalues()
+            .iter()
+            .filter(|&&v| v.abs() < 1e-6)
+            .count();
+        assert_eq!(zeros, 6);
+    }
+
+    /// A single block spanning the whole structure has only the six rigid-body modes.
+    #[test]
+    fn whole_structure_is_one_rigid_block() {
+        let atoms = cluster6();
+        let modes = NormalModes::with_blocks(&atoms, &[0; 6], &rtb_params()).unwrap();
+        assert_eq!(modes.len(), 6);
+        for &v in modes.eigenvalues() {
+            assert!(v.abs() < 1e-6);
+        }
+    }
+
+    /// DOF accounting: a 3-atom block (6 DOF) plus a singleton (3 DOF) ⇒ nb6 = 9.
+    #[test]
+    fn dof_accounting_mixes_block_sizes() {
+        let atoms = &cluster6()[..4];
+        let modes = NormalModes::with_blocks(atoms, &[0, 0, 0, 1], &rtb_params()).unwrap();
+        assert_eq!(modes.len(), 9);
+    }
+
+    /// `PᵀP = I`: since the reduced eigenvectors are orthonormal, the lifted
+    /// all-atom modes stay unit length.
+    #[test]
+    fn lifted_modes_are_unit_norm() {
+        let atoms = cluster6();
+        let modes = NormalModes::with_blocks(&atoms, &[0, 0, 0, 1, 1, 1], &rtb_params()).unwrap();
+        for i in 0..modes.len() {
+            let norm2: f64 = modes.eigenvector(i).iter().flatten().map(|x| x * x).sum();
+            assert_relative_eq!(norm2, 1.0, epsilon = 1e-9);
+        }
+    }
+
+    #[test]
+    fn block_count_must_match_atoms() {
+        let atoms = cluster6();
+        let r = NormalModes::with_blocks(&atoms, &[0, 0], &rtb_params());
+        assert!(matches!(r, Err(Error::BlockCountMismatch)));
+    }
+
+    #[test]
+    fn collinear_block_is_degenerate() {
+        // Block 0 holds two atoms — always collinear, so no rotational basis.
+        let atoms = cluster6();
+        let r = NormalModes::with_blocks(&atoms, &[0, 0, 1, 1, 1, 2], &rtb_params());
+        assert!(matches!(r, Err(Error::DegenerateBlock)));
     }
 }
