@@ -9,7 +9,7 @@ keywords = ["normal-modes", "anm", "elastic-network", "biophysics", "nma"]
 categories = ["science"]
 
 [features]
-# Opt-in partial eigensolver for the lowest non-zero modes.
+# Partial eigensolver for the lowest non-zero modes, and a SIMD dense solver.
 sparse = ["dep:faer"]
 
 [dependencies]

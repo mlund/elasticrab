@@ -14,7 +14,9 @@ user-facing; the implementation detail lives here.
 - **Pay for capability only when used.** The default build is nalgebra-only and
   dense; the partial solvers and `faer` sit behind the `sparse` feature (`faer`
   trimmed, `divan` dev-only). `k_modes` without it errors rather than silently
-  running slow.
+  running slow. Since `sparse` pulls faer anyway, the dense `eigen::solve` also
+  uses faer's SIMD eigensolver there (rayon off → deterministic); nalgebra's
+  scalar solver remains the default-build fallback.
 - **Algorithm follows the evidence.** Dense for exactness; shift-invert Lanczos
   where the soft modes resist plain Lanczos; regular-mode Lanczos for matrix-free
   RTB, skipping the factorization that dominates large systems — NOLB's trade.

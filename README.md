@@ -50,7 +50,8 @@ Deliberately stops at "frequencies and modes". Structure parsing, hydration
 shells, residue coarse-graining, and fitting amplitudes to data belong to the
 caller. The default eigensolver is **dense** (cost ∝ atom-count³), ideal for
 small and medium systems. For large systems, the optional `sparse` feature adds
-a partial solver for the lowest *k* modes.
+a partial solver for the lowest *k* modes — and also swaps in a SIMD dense
+eigensolver (~3× faster) for the full solve.
 
 ## Testing
 
@@ -77,12 +78,14 @@ numbers (one machine; the relative speedups are the point):
 
 | structure | dense | dense + blocks | sparse | sparse + blocks |
 |---|---|---|---|---|
-| medium (812 atoms) | 6.0 s | 1.5 s | 60 ms | 53 ms |
+| medium (812 atoms) | 1.8 s | 1.0 s | 60 ms | 53 ms |
 | large (8015 atoms) | — (too large) | — | 1.5 s | 0.82 s |
 
-On the medium structure the sparse solver runs **~100× faster** than dense, and
-**~25× faster** than dense with rigid blocks. On the large one — too big for a
-dense solve to fit in memory — the sparse solver finishes in about a second.
+On the medium structure the sparse solver runs **~30× faster** than dense, and
+**~17× faster** than dense with rigid blocks. On the large one — too big for a
+dense solve to fit in memory — the sparse solver finishes in about a second. (The
+dense times use the SIMD eigensolver the `sparse` feature enables; the default
+build's scalar dense solve is ~3× slower again.)
 
 ## License
 
