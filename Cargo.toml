@@ -11,6 +11,9 @@ categories = ["science"]
 [features]
 # Partial eigensolver for the lowest non-zero modes, and a SIMD dense solver.
 sparse = ["dep:faer"]
+# Multi-threaded faer kernels (rayon): faster on large systems, but results
+# differ from the serial build at the ULP level (parallel float reductions).
+parallel = ["sparse", "faer/rayon"]
 
 [dependencies]
 nalgebra = { version = "0.35", default-features = false, features = ["std"] }

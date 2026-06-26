@@ -51,7 +51,8 @@ shells, residue coarse-graining, and fitting amplitudes to data belong to the
 caller. The default eigensolver is **dense** (cost ∝ atom-count³), ideal for
 small and medium systems. For large systems, the optional `sparse` feature adds
 a partial solver for the lowest *k* modes — and also swaps in a SIMD dense
-eigensolver (~3× faster) for the full solve.
+eigensolver (~3× faster) for the full solve. A `parallel` feature adds
+multi-threading on top (trading bit-for-bit reproducibility for speed).
 
 ## Testing
 
@@ -72,20 +73,30 @@ relates to Pepsi-SAXS / NOLB.
 
 ## Benchmarks
 
-`cargo bench --features sparse` compares the dense and sparse solvers, with and
-without rigid blocks, on real protein structures (lowest 10 modes). Indicative
-numbers (one machine; the relative speedups are the point):
+`cargo bench` compares the dense and sparse solvers, with and without rigid
+blocks, on real protein structures — medium (812 atoms) and large (8015 atoms),
+lowest 10 modes. Indicative numbers (one machine; the relative speedups are the
+point). The 1-core columns use `--features sparse`, the 10-core columns use
+`--features parallel`:
 
-| structure | dense | dense + blocks | sparse | sparse + blocks |
+| solver | medium · 1 core | medium · 10 cores | large · 1 core | large · 10 cores |
 |---|---|---|---|---|
-| medium (812 atoms) | 1.8 s | 1.0 s | 60 ms | 53 ms |
-| large (8015 atoms) | — (too large) | — | 1.5 s | 0.82 s |
+| dense | 1.8 s | 0.69 s | — (too large) | — |
+| dense + rigid blocks | 1.0 s | 0.90 s | — | — |
+| sparse (lowest *k*) | 60 ms | 67 ms | 1.5 s | 1.33 s |
+| sparse + rigid blocks | 53 ms | 49 ms | 0.82 s | 0.72 s |
 
-On the medium structure the sparse solver runs **~30× faster** than dense, and
-**~17× faster** than dense with rigid blocks. On the large one — too big for a
-dense solve to fit in memory — the sparse solver finishes in about a second. (The
-dense times use the SIMD eigensolver the `sparse` feature enables; the default
-build's scalar dense solve is ~3× slower again.)
+The sparse solvers run **~30× faster** than the full dense solve and handle the
+large structure that dense cannot fit in memory.
+
+Multi-threading (`parallel`) helps the **full dense** solve, but the sweet spot
+is about half the cores, not all of them: it bottoms out near 0.64 s at 8 threads
+and regresses at 10 (faer oversubscribes by a couple of threads). The
+**partial/sparse** solvers barely parallelize — their Lanczos loop is serial —
+and get *slower* with more threads (sparse-medium is fastest at one core). So set
+`RAYON_NUM_THREADS` to roughly your core count for the dense path, and keep it low
+(1–2) for the partial solvers. Without any feature the dense solve uses nalgebra's
+scalar eigensolver, ~3× slower again.
 
 ## License
 
