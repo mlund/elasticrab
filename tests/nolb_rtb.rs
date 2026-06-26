@@ -6,7 +6,7 @@
 //! global unit constant, so we check that elasticrab's spectrum is *proportional*
 //! to NOLB's. The reference frequencies are vendored in `tests/data/` (generated
 //! once with the NOLB binary); this test never invokes it. See the fixture
-//! header and `docs/PEPSI_COMPARISON.md`.
+//! header for the exact command.
 
 use elasticrab::{Atom, NormalModes, Params};
 
