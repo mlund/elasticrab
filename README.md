@@ -66,11 +66,13 @@ the rigid-body null space, the diatomic reduced-mass relation
 ## Visualizing a mode
 
 `NormalModes::displace(positions, i, amplitude)` returns the structure pushed
-along mode `i` — sweep `amplitude` to make a trajectory you can watch. The
+along mode `i` — sweep `amplitude` to make a trajectory you can watch.
+`displace_nonlinear` instead moves each rigid block as a rigid body (NOLB's
+nonlinear extrapolation), keeping bonds rigid at large amplitude. The
 `animate_pdb` example turns a mode into a multi-model PDB for PyMOL or VMD:
 
 ```sh
-cargo run --example animate_pdb -- protein.pdb > mode6.pdb   # args: [amplitude] [mode] [frames]
+cargo run --example animate_pdb -- protein.pdb > mode6.pdb   # [peak-rmsd-Å] [mode] [frames] [--nonlinear]
 ```
 
 ## Benchmarks

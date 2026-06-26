@@ -3,3 +3,7 @@
 
 # editor swap files
 *.swp
+
+# animation output written to the repo root by the animate_pdb example
+# (tracked fixtures live under tests/data/ and are unaffected)
+/*.pdb

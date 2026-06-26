@@ -21,6 +21,21 @@ pub(crate) type ProjectionEntries = (Vec<(usize, usize, f64)>, usize);
 /// well-defined rotational basis.
 const DEGENERATE_RATIO: f64 = 1e-9;
 
+/// The rigid geometry of one block: which atoms it holds, where its columns sit
+/// in the reduced space, and the quantities the projection and the nonlinear
+/// extrapolation both need — centre of mass, total (weighted) mass, and the
+/// inertia inverse square root (`None` for a single-atom block, which has no
+/// rotational basis).
+#[derive(Debug)]
+pub(crate) struct BlockGeometry {
+    pub atoms: Vec<usize>,
+    pub col: usize,
+    pub dof: usize,
+    pub com: Vector3<f64>,
+    pub total_mass: f64,
+    pub isqrt: Option<Matrix3<f64>>,
+}
+
 /// Build the RTB projection `P` of shape `3·n_atoms × nb6`.
 ///
 /// `weights` are per-atom (all `1.0` reproduces the conventional unit-mass RTB;
@@ -50,22 +65,66 @@ pub(crate) fn projection_entries(
     weights: &[f64],
     blocks: &[usize],
 ) -> Result<ProjectionEntries, Error> {
-    let groups = group_by_block(blocks);
-    let nb6 = groups.iter().map(|g| block_dof(g.len())).sum();
+    let geometry = block_geometry(positions, weights, blocks)?;
+    let nb6 = geometry.iter().map(|g| g.dof).sum();
 
     let mut entries = Vec::new();
-    let mut col = 0;
-    for atoms in &groups {
-        block_columns(
+    for block in &geometry {
+        emit_block_columns(
             &mut |r, c, v| entries.push((r, c, v)),
             positions,
             weights,
-            atoms,
-            col,
-        )?;
-        col += block_dof(atoms.len());
+            block,
+        );
     }
     Ok((entries, nb6))
+}
+
+/// Per-block rigid geometry, in first-appearance order of the block ids. Shared
+/// by the projection (which turns it into matrix columns) and the nonlinear
+/// extrapolation (which turns the reduced velocities into rigid motions).
+pub(crate) fn block_geometry(
+    positions: &[[f64; 3]],
+    weights: &[f64],
+    blocks: &[usize],
+) -> Result<Vec<BlockGeometry>, Error> {
+    let groups = group_by_block(blocks);
+    let mut geometry = Vec::with_capacity(groups.len());
+    let mut col = 0;
+    for atoms in groups {
+        let dof = block_dof(atoms.len());
+        let total_mass: f64 = atoms.iter().map(|&i| weights[i]).sum();
+
+        let mut com = Vector3::zeros();
+        for &i in &atoms {
+            com += weights[i] * Vector3::from(positions[i]);
+        }
+        com /= total_mass;
+
+        // The inertia inverse square root orthonormalizes the rotational basis;
+        // a single-atom block has no rotation, so none is needed.
+        let isqrt = if atoms.len() == 1 {
+            None
+        } else {
+            let mut inertia = Matrix3::zeros();
+            for &i in &atoms {
+                let x = Vector3::from(positions[i]) - com;
+                inertia += weights[i] * (x.dot(&x) * Matrix3::identity() - x * x.transpose());
+            }
+            Some(inverse_sqrt(inertia)?)
+        };
+
+        geometry.push(BlockGeometry {
+            atoms,
+            col,
+            dof,
+            com,
+            total_mass,
+            isqrt,
+        });
+        col += dof;
+    }
+    Ok(geometry)
 }
 
 const fn block_dof(size: usize) -> usize {
@@ -91,66 +150,43 @@ fn group_by_block(blocks: &[usize]) -> Vec<Vec<usize>> {
 }
 
 /// Emit the translation (and, for multi-atom blocks, rotation) column entries
-/// for one block starting at column `col`, as `(row, col, value)` via `emit`.
-fn block_columns(
+/// for one block as `(row, col, value)` via `emit`. The geometry was already
+/// computed by [`block_geometry`]; this turns it into the projection's columns.
+fn emit_block_columns(
     emit: &mut impl FnMut(usize, usize, f64),
     positions: &[[f64; 3]],
     weights: &[f64],
-    atoms: &[usize],
-    col: usize,
-) -> Result<(), Error> {
-    let total_w: f64 = atoms.iter().map(|&i| weights[i]).sum();
-    let sqrt_total = total_w.sqrt();
-
-    let mut center = Vector3::zeros();
-    for &i in atoms {
-        center += weights[i] * Vector3::from(positions[i]);
-    }
-    center /= total_w;
+    block: &BlockGeometry,
+) {
+    let sqrt_total = block.total_mass.sqrt();
 
     // Translations: a uniform shift of the block, normalized in the (weighted)
     // metric so the column is unit length.
-    for &i in atoms {
+    for &i in &block.atoms {
         let s = weights[i].sqrt() / sqrt_total;
         for axis in 0..3 {
-            emit(3 * i + axis, col + axis, s);
+            emit(3 * i + axis, block.col + axis, s);
         }
     }
 
-    if atoms.len() == 1 {
-        return Ok(());
-    }
-
-    // Rotations: orthonormalized via the inverse square root of the block's
-    // (weighted) inertia tensor, so the three rotational columns are unit length
-    // and mutually orthogonal.
-    let offsets: Vec<Vector3<f64>> = atoms
-        .iter()
-        .map(|&i| Vector3::from(positions[i]) - center)
-        .collect();
-
-    let mut inertia = Matrix3::zeros();
-    for (&i, x) in atoms.iter().zip(&offsets) {
-        inertia += weights[i] * (x.dot(x) * Matrix3::identity() - x * x.transpose());
-    }
-    let isqrt = inverse_sqrt(inertia)?;
-
-    // The three orthonormalized rotation generators (rows of the inertia inverse
-    // square root) are the same for every atom, so build them once.
+    // Rotations: orthonormalized by the inertia inverse square root, so the three
+    // rotational columns are unit length and mutually orthogonal.
+    let Some(isqrt) = block.isqrt else {
+        return;
+    };
     let generators: [Vector3<f64>; 3] =
         std::array::from_fn(|axis| Vector3::from(isqrt.row(axis).transpose()));
-
-    for (&i, x) in atoms.iter().zip(&offsets) {
+    for &i in &block.atoms {
+        let x = Vector3::from(positions[i]) - block.com;
         let s = weights[i].sqrt();
         for (axis, generator) in generators.iter().enumerate() {
             // Displacement of atom i under rotation `axis` is generator × offset.
-            let rot = generator.cross(x);
+            let rot = generator.cross(&x);
             for coord in 0..3 {
-                emit(3 * i + coord, col + 3 + axis, s * rot[coord]);
+                emit(3 * i + coord, block.col + 3 + axis, s * rot[coord]);
             }
         }
     }
-    Ok(())
 }
 
 /// Symmetric inverse square root `A·diag(1/√λ)·Aᵀ` of a positive-definite 3×3

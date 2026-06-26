@@ -132,6 +132,11 @@ fn gershgorin_bound(acc: &HashMap<(usize, usize), f64>, dof: usize) -> f64 {
     row_abs.iter().copied().fold(0.0_f64, f64::max)
 }
 
+/// `(eigenvalues, lifted all-atom vectors, reduced block-space vectors)`. The
+/// reduced vectors carry the per-block velocities the nonlinear extrapolation
+/// needs; the lifted ones are the per-atom mode shapes.
+pub(crate) type RtbModes = (Vec<f64>, DMatrix<f64>, DMatrix<f64>);
+
 /// Matrix-free RTB partial solver: the `k` lowest non-zero modes of the reduced
 /// operator `R = Pᵀ K P`, applied without ever forming `R`. Regular-mode Lanczos
 /// on `c·I − R` (whose largest eigenvalues are `R`'s smallest, recovered as
@@ -143,7 +148,7 @@ pub(crate) fn lowest_rtb_modes(
     gamma: f64,
     contacts: &[Contact],
     k: usize,
-) -> Result<(Vec<f64>, DMatrix<f64>), Error> {
+) -> Result<RtbModes, Error> {
     let dof = 3 * positions.len();
     let scale = crate::hessian::dof_scale(weights);
     let acc = hessian_entries(gamma, &scale, contacts);
@@ -188,15 +193,22 @@ pub(crate) fn lowest_rtb_modes(
     modes.truncate(k);
 
     let eigenvalues: Vec<f64> = modes.iter().map(|&(l, _)| l).collect();
-    // Lift each selected reduced eigenvector to all-atom space with P.
+    // Keep the reduced (block-space) eigenvectors and also lift them to all-atom
+    // space with P. The reduced ones carry the per-block velocities the nonlinear
+    // extrapolation needs; the lifted ones are the per-atom mode shapes.
+    let mut reduced = DMatrix::zeros(nb6, modes.len());
     let mut vectors = DMatrix::zeros(dof, modes.len());
     for (out, &(_, ritz_col)) in modes.iter().enumerate() {
-        let lifted = &p * &Col::from_fn(nb6, |i| ritz[(i, ritz_col)]);
+        let reduced_mode = Col::from_fn(nb6, |i| ritz[(i, ritz_col)]);
+        let lifted = &p * &reduced_mode;
+        for r in 0..nb6 {
+            reduced[(r, out)] = reduced_mode[r];
+        }
         for r in 0..dof {
             vectors[(r, out)] = lifted[r];
         }
     }
-    Ok((eigenvalues, vectors))
+    Ok((eigenvalues, vectors, reduced))
 }
 
 /// Full-reorthogonalization Lanczos on the operator `op` (here `(K + εI)⁻¹`).

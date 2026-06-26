@@ -1,7 +1,7 @@
 //! Animate a normal mode of a protein into a multi-model PDB trajectory.
 //!
 //! ```text
-//! cargo run --example animate_pdb -- <in.pdb> [amplitude=2.0] [mode=6] [frames=20] > mode.pdb
+//! cargo run --example animate_pdb -- <in.pdb> [peak-rmsd-A=1.5] [mode=6] [frames=20] [--nonlinear] > mode.pdb
 //! ```
 //!
 //! Reads a PDB, builds a mass-weighted Rotation-Translation-Blocks model (one
@@ -9,7 +9,9 @@
 //! `frames` `MODEL` records that sweep the structure back and forth along one
 //! mode — load the result in PyMOL or VMD to watch the motion. Mode 6 (the first
 //! non-zero mode, after the six rigid-body ones) is the softest, most visible
-//! collective motion.
+//! collective motion. `--nonlinear` uses NOLB's rigid-block extrapolation, which
+//! keeps bonds rigid at large amplitude; the default linear sweep is simpler but
+//! stretches them.
 //!
 //! The PDB column parsing and atom filtering are adapted from voronota-ltr
 //! (`src/input/pdb.rs`, MIT, K. Olechnovic & M. Lund).
@@ -33,26 +35,44 @@ struct Record {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-    let Some(path) = args.get(1) else {
-        eprintln!("usage: animate_pdb <in.pdb> [amplitude=2.0] [mode=6] [frames=20]");
-        return ExitCode::FAILURE;
-    };
-    let amplitude = parse_arg(&args, 2, 2.0);
-    let mode = parse_arg(&args, 3, 6);
-    let frames = parse_arg(&args, 4, 20);
-
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) => {
-            eprintln!("cannot read {path}: {e}");
-            return ExitCode::FAILURE;
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
         }
-    };
+    }
+}
+
+fn run() -> Result<(), String> {
+    // `--nonlinear` is the only flag; any other `-`/`--` argument is a mistake
+    // (e.g. a misspelled `--non_linear`) and must not be silently ignored.
+    let mut nonlinear = false;
+    let mut positional = Vec::new();
+    for arg in std::env::args().skip(1) {
+        if arg == "--nonlinear" {
+            nonlinear = true;
+        } else if arg.starts_with('-') {
+            return Err(format!("unknown flag {arg:?}"));
+        } else {
+            positional.push(arg);
+        }
+    }
+    if positional.is_empty() || positional.len() > 4 {
+        return Err(
+            "usage: animate_pdb <in.pdb> [peak-rmsd-A=1.5] [mode=6] [frames=20] [--nonlinear]"
+                .into(),
+        );
+    }
+    let path = &positional[0];
+    let peak_rmsd: f64 = parse_arg(&positional, 1, 1.5)?;
+    let mode: usize = parse_arg(&positional, 2, 6)?;
+    let frames: usize = parse_arg(&positional, 3, 20)?;
+
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let records = parse_pdb(&text);
     if records.len() < 2 {
-        eprintln!("need at least two atoms; parsed {}", records.len());
-        return ExitCode::FAILURE;
+        return Err(format!("need at least two atoms; parsed {}", records.len()));
     }
 
     let atoms: Vec<Atom> = records
@@ -69,16 +89,13 @@ fn main() -> ExitCode {
     let mut params = Params::default();
     params.cutoff = 5.0;
     params.mass_weighted = true;
-    let modes = match NormalModes::with_blocks(&atoms, &blocks, &params) {
-        Ok(modes) => modes,
-        Err(e) => {
-            eprintln!("normal-mode analysis failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let modes = NormalModes::with_blocks(&atoms, &blocks, &params)
+        .map_err(|e| format!("normal-mode analysis failed: {e}"))?;
     if mode >= modes.len() {
-        eprintln!("mode {mode} out of range (only {} modes)", modes.len());
-        return ExitCode::FAILURE;
+        return Err(format!(
+            "mode {mode} out of range (only {} modes)",
+            modes.len()
+        ));
     }
     if !modes.disconnected().is_empty() {
         eprintln!(
@@ -87,11 +104,26 @@ fn main() -> ExitCode {
         );
     }
 
+    // Scale the raw amplitude so the peak frame reaches the requested RMSD from
+    // the input (as ProDy's traverseMode does). The mode vectors are unit-norm,
+    // so a raw amplitude is unintuitive and small values barely move the
+    // structure — at which scale linear and nonlinear are indistinguishable.
+    let unit = modes.displace(&positions, mode, 1.0);
+    let amplitude = peak_rmsd / rms_deviation(&unit, &positions);
+
     let mut out = String::new();
     for frame in 0..frames {
         // sin sweep: a smooth there-and-back loop that starts at the input.
         let phase = std::f64::consts::TAU * frame as f64 / frames as f64;
-        let displaced = modes.displace(&positions, mode, amplitude * phase.sin());
+        let factor = amplitude * phase.sin();
+        let displaced = if nonlinear {
+            // The example always uses with_blocks, so the rigid-block data is present.
+            modes
+                .displace_nonlinear(&positions, mode, factor)
+                .expect("with_blocks supplies the rigid blocks")
+        } else {
+            modes.displace(&positions, mode, factor)
+        };
         let _ = writeln!(out, "MODEL     {:>4}", frame + 1);
         for (record, &p) in records.iter().zip(&displaced) {
             write_atom_line(&mut out, record, p);
@@ -99,11 +131,26 @@ fn main() -> ExitCode {
         out.push_str("ENDMDL\n");
     }
     print!("{out}");
-    ExitCode::SUCCESS
+    Ok(())
 }
 
-fn parse_arg<T: std::str::FromStr>(args: &[String], i: usize, default: T) -> T {
-    args.get(i).and_then(|s| s.parse().ok()).unwrap_or(default)
+/// Parse the `i`-th positional argument, or fall back to `default` if it is
+/// absent — but a *present* yet unparseable value is an error, not a silent default.
+fn parse_arg<T: std::str::FromStr>(args: &[String], i: usize, default: T) -> Result<T, String> {
+    args.get(i).map_or_else(
+        || Ok(default),
+        |s| s.parse().map_err(|_| format!("invalid argument {s:?}")),
+    )
+}
+
+/// Root-mean-square deviation between two coordinate sets.
+fn rms_deviation(a: &[[f64; 3]], b: &[[f64; 3]]) -> f64 {
+    let total: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(p, q)| (0..3).map(|c| (p[c] - q[c]).powi(2)).sum::<f64>())
+        .sum();
+    (total / a.len() as f64).sqrt()
 }
 
 /// Standard atomic weights for the common protein elements; a neutral fallback

@@ -44,9 +44,10 @@ mod rtb;
 #[cfg(feature = "sparse")]
 mod sparse;
 
-use nalgebra::DMatrix;
+use nalgebra::{DMatrix, Rotation3, Unit, Vector3};
 
 use network::Contact;
+use rtb::BlockGeometry;
 
 /// A point mass in the elastic network.
 ///
@@ -116,6 +117,10 @@ pub enum Error {
     SparseFeatureRequired,
     /// The sparse solver could not factor the Hessian or did not converge.
     SparseSolverFailed,
+    /// [`NormalModes::displace_nonlinear`] was called on a result that has no
+    /// rigid blocks — it needs the per-block velocities only
+    /// [`NormalModes::with_blocks`] retains. Build the modes with `with_blocks`.
+    NotRigidBlocks,
 }
 
 impl std::fmt::Display for Error {
@@ -127,6 +132,7 @@ impl std::fmt::Display for Error {
             Self::DegenerateBlock => write!(f, "a multi-atom block is collinear or coincident"),
             Self::SparseFeatureRequired => write!(f, "k_modes requires the `sparse` feature"),
             Self::SparseSolverFailed => write!(f, "the sparse solver failed"),
+            Self::NotRigidBlocks => write!(f, "nonlinear modes require with_blocks"),
         }
     }
 }
@@ -148,6 +154,20 @@ pub struct NormalModes {
     n_atoms: usize,
     /// Original indices of atoms dropped for being disconnected (degree 0).
     disconnected: Vec<usize>,
+    /// Rigid-block decomposition, kept only for [`with_blocks`](NormalModes::with_blocks)
+    /// results; it carries the per-block velocities the nonlinear extrapolation needs.
+    rtb: Option<Rtb>,
+}
+
+/// The data the nonlinear extrapolation needs beyond the per-atom mode shapes:
+/// the reduced (block-space) eigenvectors and each block's rigid geometry.
+#[derive(Debug)]
+struct Rtb {
+    /// Reduced eigenvectors, `nb6 × n_modes`; column `i` holds mode `i`'s
+    /// per-block linear and angular velocities in the orthonormal RTB basis.
+    reduced: DMatrix<f64>,
+    /// Per-block geometry, with atom indices in the *original* numbering.
+    blocks: Vec<BlockGeometry>,
 }
 
 /// Eigenvalues at or below this magnitude are treated as rigid-body (zero)
@@ -159,6 +179,11 @@ const ZERO_EIGENVALUE: f64 = 1e-6;
 /// meaningful relative to `gamma` and your unit choices, so callers commonly
 /// rescale the result regardless.
 const BOLTZMANN_KCAL_PER_MOL_K: f64 = 1.987_204_259e-3;
+
+/// Below this angular speed a block's nonlinear motion is treated as a pure
+/// translation, which also guards the rotation-axis normalization against a
+/// near-zero vector.
+const ROTATION_EPS: f64 = 1e-12;
 
 /// Shared validation: returns per-atom positions and the per-atom weights used
 /// by the Hessian and any block projection (atomic masses when mass-weighting,
@@ -357,13 +382,11 @@ impl NormalModes {
         let p = rtb::projection(&net.positions, &net.weights, &blocks)?;
         let reduced = p.tr_mul(&(&h * &p));
         let spectrum = eigen::solve(reduced);
-        let all_atom = &p * spectrum.eigenvectors;
-        Ok(Self::from_modes(
-            spectrum.eigenvalues,
-            &all_atom,
-            &net,
-            atoms.len(),
-        ))
+        let all_atom = &p * &spectrum.eigenvectors;
+        let rtb = Self::build_rtb(&net, &blocks, spectrum.eigenvectors)?;
+        let mut modes = Self::from_modes(spectrum.eigenvalues, &all_atom, &net, atoms.len());
+        modes.rtb = Some(rtb);
+        Ok(modes)
     }
 
     /// The `k` lowest non-zero RTB modes via the matrix-free partial solver.
@@ -375,7 +398,7 @@ impl NormalModes {
         k: usize,
         n_original: usize,
     ) -> Result<Self, Error> {
-        let (eigenvalues, vectors) = sparse::lowest_rtb_modes(
+        let (eigenvalues, vectors, reduced) = sparse::lowest_rtb_modes(
             &net.positions,
             &net.weights,
             blocks,
@@ -383,7 +406,10 @@ impl NormalModes {
             &net.contacts,
             k,
         )?;
-        Ok(Self::from_modes(eigenvalues, &vectors, net, n_original))
+        let rtb = Self::build_rtb(net, blocks, reduced)?;
+        let mut modes = Self::from_modes(eigenvalues, &vectors, net, n_original);
+        modes.rtb = Some(rtb);
+        Ok(modes)
     }
 
     #[cfg(not(feature = "sparse"))]
@@ -420,7 +446,24 @@ impl NormalModes {
             modes,
             n_atoms: n_original,
             disconnected: net.disconnected.clone(),
+            rtb: None,
         }
+    }
+
+    /// Build the rigid-block decomposition kept by the RTB constructors: the
+    /// reduced eigenvectors plus per-block geometry, with block atoms remapped
+    /// from the connected numbering back to the original atom indices.
+    fn build_rtb(net: &Network, blocks: &[usize], reduced: DMatrix<f64>) -> Result<Rtb, Error> {
+        let mut geometry = rtb::block_geometry(&net.positions, &net.weights, blocks)?;
+        for block in &mut geometry {
+            for atom in &mut block.atoms {
+                *atom = net.keep[*atom];
+            }
+        }
+        Ok(Rtb {
+            reduced,
+            blocks: geometry,
+        })
     }
 
     /// Number of modes: three per connected atom for the plain model, or the
@@ -478,6 +521,75 @@ impl NormalModes {
                 ]
             })
             .collect()
+    }
+
+    /// New positions with each rigid block carried along mode `i` by `amplitude`
+    /// as a **rigid motion** (NOLB's nonlinear extrapolation): the block rotates
+    /// about its centre of mass and translates, so bond lengths *within* a block
+    /// are preserved at any amplitude — unlike [`displace`](Self::displace), whose
+    /// straight-line motion stretches them. This is the physical motion, so it is
+    /// independent of mass-weighting and agrees with `displace` only at small
+    /// amplitude (and only on the unit-mass path).
+    ///
+    /// Disconnected atoms stay put.
+    ///
+    /// # Errors
+    /// [`Error::NotRigidBlocks`] if the modes came from [`new`](Self::new), which
+    /// keeps no blocks. Build them with [`with_blocks`](Self::with_blocks).
+    ///
+    /// # Panics
+    /// If `i >= self.len()`, or `positions.len()` is not the original atom count.
+    pub fn displace_nonlinear(
+        &self,
+        positions: &[[f64; 3]],
+        i: usize,
+        amplitude: f64,
+    ) -> Result<Vec<[f64; 3]>, Error> {
+        let rtb = self.rtb.as_ref().ok_or(Error::NotRigidBlocks)?;
+        assert!(i < self.len(), "mode index out of range");
+        assert_eq!(
+            positions.len(),
+            self.n_atoms,
+            "positions must have one entry per atom"
+        );
+
+        let mut out = positions.to_vec();
+        for block in &rtb.blocks {
+            // Un-weight the reduced velocities to physical ones (NOLB eq 1.11):
+            // v = ṽ_w/√M_b, ω = I^{-1/2}·ω̃_w. A singleton has no rotation.
+            let col = block.col;
+            let velocity = Vector3::new(
+                rtb.reduced[(col, i)],
+                rtb.reduced[(col + 1, i)],
+                rtb.reduced[(col + 2, i)],
+            );
+            let translation = amplitude * (velocity / block.total_mass.sqrt());
+            // The block's rotation about its COM by Δφ = a‖ω‖ about ω̂ is the same
+            // for every atom, so build it once; a singleton or vanishing rotation
+            // leaves only the translation.
+            let rotation = block.isqrt.and_then(|isqrt| {
+                let omega = isqrt
+                    * Vector3::new(
+                        rtb.reduced[(col + 3, i)],
+                        rtb.reduced[(col + 4, i)],
+                        rtb.reduced[(col + 5, i)],
+                    );
+                let speed = omega.norm();
+                (speed > ROTATION_EPS).then(|| {
+                    Rotation3::from_axis_angle(&Unit::new_normalize(omega), amplitude * speed)
+                })
+            });
+
+            for &atom in &block.atoms {
+                let position = Vector3::from(positions[atom]);
+                let moved = rotation.as_ref().map_or_else(
+                    || position + translation,
+                    |rotation| rotation * (position - block.com) + block.com + translation,
+                );
+                out[atom] = [moved.x, moved.y, moved.z];
+            }
+        }
+        Ok(out)
     }
 
     /// Original indices of atoms dropped from the analysis for being
@@ -866,6 +978,134 @@ mod tests {
 
         let moved = modes.displace(&positions, 6, 5.0);
         assert_eq!(moved[6], positions[6]);
+    }
+
+    fn distance(p: &[[f64; 3]], a: usize, b: usize) -> f64 {
+        ((p[a][0] - p[b][0]).powi(2) + (p[a][1] - p[b][1]).powi(2) + (p[a][2] - p[b][2]).powi(2))
+            .sqrt()
+    }
+
+    /// The defining property: nonlinear extrapolation moves each block as a rigid
+    /// body, so intra-block distances are preserved at large amplitude — and at
+    /// least one mode genuinely rotates a block (so linear and nonlinear differ).
+    #[test]
+    fn nonlinear_preserves_intra_block_distances() {
+        let atoms = cluster6();
+        let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
+        let modes = NormalModes::with_blocks(&atoms, &[0, 0, 0, 1, 1, 1], &rtb_params()).unwrap();
+
+        let mut saw_rotation = false;
+        for i in 6..modes.len() {
+            let moved = modes.displace_nonlinear(&positions, i, 3.0).unwrap();
+            for group in [[0, 1, 2], [3, 4, 5]] {
+                for &a in &group {
+                    for &b in &group {
+                        assert_relative_eq!(
+                            distance(&moved, a, b),
+                            distance(&positions, a, b),
+                            epsilon = 1e-9
+                        );
+                    }
+                }
+            }
+            let linear = modes.displace(&positions, i, 3.0);
+            if moved
+                .iter()
+                .zip(&linear)
+                .any(|(m, l)| (m[0] - l[0]).abs() > 1e-6)
+            {
+                saw_rotation = true;
+            }
+        }
+        assert!(saw_rotation, "expected at least one mode to rotate a block");
+    }
+
+    /// Single-atom blocks have no rotation, so nonlinear reduces to the linear
+    /// translation (on the unit-mass path the two coincide exactly).
+    #[test]
+    fn nonlinear_singleton_blocks_equal_linear() {
+        let atoms = cluster6();
+        let blocks: Vec<usize> = (0..atoms.len()).collect();
+        let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
+        let modes = NormalModes::with_blocks(&atoms, &blocks, &rtb_params()).unwrap();
+
+        for i in 6..modes.len() {
+            let nonlinear = modes.displace_nonlinear(&positions, i, 1.5).unwrap();
+            let linear = modes.displace(&positions, i, 1.5);
+            for (a, b) in nonlinear.iter().zip(&linear) {
+                for c in 0..3 {
+                    assert_relative_eq!(a[c], b[c], epsilon = 1e-9);
+                }
+            }
+        }
+    }
+
+    /// Ties the nonlinear reconstruction to the ProDy/NOLB-validated modes: at
+    /// small amplitude the rigid motion is the *physical* velocity field, which
+    /// equals the mass-weighted lifted mode (what `displace` returns) divided by
+    /// `√mass` per atom. Holding for every mode means `v = ṽ_w/√M_b`,
+    /// `ω = I^{-1/2}·ω̃_w` reconstructs the modes exactly.
+    #[test]
+    fn nonlinear_small_amplitude_is_physical_mode() {
+        let atoms = vec![
+            Atom {
+                position: [0.0, 0.0, 0.0],
+                mass: 12.0,
+            },
+            Atom {
+                position: [1.2, 0.0, 0.0],
+                mass: 14.0,
+            },
+            Atom {
+                position: [0.0, 1.2, 0.0],
+                mass: 16.0,
+            },
+            Atom {
+                position: [3.0, 0.0, 1.0],
+                mass: 12.0,
+            },
+            Atom {
+                position: [4.2, 0.2, 0.5],
+                mass: 32.0,
+            },
+            Atom {
+                position: [3.0, 1.2, 1.5],
+                mass: 14.0,
+            },
+        ];
+        let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
+        let params = Params {
+            cutoff: 5.0,
+            mass_weighted: true,
+            ..Params::default()
+        };
+        let modes = NormalModes::with_blocks(&atoms, &[0, 0, 0, 1, 1, 1], &params).unwrap();
+
+        let a = 1e-6;
+        for i in 6..modes.len() {
+            let nonlinear = modes.displace_nonlinear(&positions, i, a).unwrap();
+            let lifted = modes.displace(&positions, i, a);
+            for (k, atom) in atoms.iter().enumerate() {
+                let sqrt_m = atom.mass.sqrt();
+                for c in 0..3 {
+                    let physical = (nonlinear[k][c] - positions[k][c]) * sqrt_m;
+                    let lifted_c = lifted[k][c] - positions[k][c];
+                    assert_relative_eq!(physical, lifted_c, epsilon = 1e-12, max_relative = 1e-5);
+                }
+            }
+        }
+    }
+
+    /// Nonlinear modes need the rigid-block data, so the plain solver is rejected.
+    #[test]
+    fn nonlinear_requires_blocks() {
+        let atoms = cluster6();
+        let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
+        let modes = NormalModes::new(&atoms, &rtb_params()).unwrap();
+        assert!(matches!(
+            modes.displace_nonlinear(&positions, 6, 1.0),
+            Err(Error::NotRigidBlocks)
+        ));
     }
 
     /// Without the `sparse` feature, requesting `k_modes` is an explicit error
