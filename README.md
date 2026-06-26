@@ -30,7 +30,7 @@ let amplitudes  = modes.thermal_amplitudes(300.0);
 
 - **ANM normal modes** — dense all-atom solve; optional mass-weighting; defaults match ProDy.
 - **Rigid blocks (RTB)** — the Rotation-Translation Blocks reduction of Pepsi-SAXS / NOLB.
-- **Partial solver** (`sparse`) — the lowest *k* modes for large systems, plus a SIMD dense eigensolver; `parallel` adds multi-threading.
+- **Partial solver** (`Params::k_modes`) — return just the lowest *k* modes; `sparse` makes it scale to large systems (and adds a SIMD dense solver), `parallel` multi-threads.
 - **Cell-list neighbour search** — linear in atom count; disconnected atoms are dropped, as Pepsi-SAXS / NOLB do.
 - **Mode visualization** — linear and NOLB nonlinear (bond-preserving) displacement; the `animate_pdb` example writes a multi-model PDB.
 - **Tests** (`cargo test`) — property, analytic, and golden tests: exact ProDy spectra (1UBI, 2GB1) and ~6-digit NOLB agreement (crambin), including the disconnected-atom drop.
@@ -52,10 +52,11 @@ Everything beyond the plain dense solve is opt-in:
 - **Rigid blocks** (`NormalModes::with_blocks`): treat groups of atoms as rigid
   bodies to shrink the eigenproblem (the Rotation-Translation Blocks method of
   Pepsi-SAXS / NOLB).
-- **Partial solving** (`sparse` feature + `Params::k_modes`): for systems too
-  large to diagonalize, compute only the lowest *k* non-zero modes — for both the
-  plain and the rigid-block model. The feature also swaps in a SIMD dense
-  eigensolver (~3× faster) for the full solve.
+- **Partial solving** (`Params::k_modes`): return only the lowest *k* non-zero
+  modes — for both the plain and the rigid-block model. The `sparse` feature
+  computes them without ever forming the dense Hessian (what scales to large
+  systems) and adds a SIMD dense eigensolver (~3× faster) for the full solve;
+  without it, `k_modes` falls back to a dense solve.
 - **Multi-threading** (`parallel` feature): faster on large dense solves, at the
   cost of bit-for-bit reproducibility.
 - **Disconnected atoms** are dropped: an atom with no neighbour within the cutoff

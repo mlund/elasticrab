@@ -27,9 +27,9 @@
 //! coarse-graining, and any fitting of amplitudes to data belong to the caller.
 //!
 //! The default solver is **dense** (cost grows with the cube of the atom count),
-//! ideal for small and medium systems. For large systems, the optional `sparse`
-//! feature adds a partial solver: set [`Params::k_modes`] to compute only the
-//! lowest *k* non-zero modes from the sparse Hessian, never forming a dense one.
+//! ideal for small and medium systems. [`Params::k_modes`] returns only the
+//! lowest *k* non-zero modes; the optional `sparse` feature then computes them
+//! without forming the dense Hessian, which is what scales to large systems.
 
 #![deny(missing_docs)]
 // Deliberate choices that conflict with two `clippy::nursery` lints:
@@ -79,9 +79,11 @@ pub struct Params {
     /// instead of `H`; eigenvalues are then squared frequencies `ω²`.
     pub mass_weighted: bool,
     /// Number of lowest *non-zero* modes to compute. `None` (the default) returns
-    /// all modes, including the ~6 rigid-body ones, via a dense solve. `Some(k)`
-    /// returns exactly the `k` lowest non-zero modes from a sparse partial solver
-    /// — rigid-body modes excluded — and requires the `sparse` crate feature.
+    /// all modes, including the ~6 rigid-body ones. `Some(k)` returns exactly the
+    /// `k` lowest non-zero modes (rigid-body modes excluded). The `sparse` feature
+    /// computes them without ever forming the dense Hessian, which is what makes
+    /// large systems feasible; without it the result is the same but comes from a
+    /// full dense solve, so it is practical only up to medium systems.
     pub k_modes: Option<usize>,
 }
 
@@ -112,9 +114,6 @@ pub enum Error {
     /// it has no well-defined rotational basis. Use a single-atom block, or
     /// blocks of three or more non-collinear atoms.
     DegenerateBlock,
-    /// [`Params::k_modes`] was set but the crate was built without the `sparse`
-    /// feature, which provides the partial eigensolver.
-    SparseFeatureRequired,
     /// The sparse solver could not factor the Hessian or did not converge.
     SparseSolverFailed,
     /// [`NormalModes::displace_nonlinear`] was called on a result that has no
@@ -130,7 +129,6 @@ impl std::fmt::Display for Error {
             Self::NotFinite => write!(f, "non-finite coordinate or mass"),
             Self::BlockCountMismatch => write!(f, "blocks must have one entry per atom"),
             Self::DegenerateBlock => write!(f, "a multi-atom block is collinear or coincident"),
-            Self::SparseFeatureRequired => write!(f, "k_modes requires the `sparse` feature"),
             Self::SparseSolverFailed => write!(f, "the sparse solver failed"),
             Self::NotRigidBlocks => write!(f, "nonlinear modes require with_blocks"),
         }
@@ -223,6 +221,25 @@ fn build_hessian(
     h
 }
 
+/// Indices of the lowest `k` non-zero (non-rigid-body) modes of an
+/// ascending-sorted dense spectrum — the dense fallback for `k_modes` when the
+/// `sparse` partial solver is not compiled in. The rigid-body zeros are the
+/// leading entries, so the wanted modes are the contiguous tail above them.
+fn lowest_nonzero_columns(eigenvalues: &[f64], k: usize) -> Vec<usize> {
+    eigenvalues
+        .iter()
+        .enumerate()
+        .filter(|(_, &lambda)| lambda > ZERO_EIGENVALUE)
+        .map(|(column, _)| column)
+        .take(k)
+        .collect()
+}
+
+/// A new matrix holding the given columns of `m`, in order.
+fn pick_columns(m: &DMatrix<f64>, columns: &[usize]) -> DMatrix<f64> {
+    DMatrix::from_fn(m.nrows(), columns.len(), |r, idx| m[(r, columns[idx])])
+}
+
 /// The connected elastic network, ready to solve: positions, weights, and
 /// contacts renumbered to the atoms a spring actually touches. `keep[p]` is the
 /// original index of kept atom `p`; `disconnected` lists the degree-0 atoms that
@@ -310,18 +327,29 @@ impl NormalModes {
     pub fn new(atoms: &[Atom], params: &Params) -> Result<Self, Error> {
         let net = prepare(atoms, params)?;
 
+        // The `sparse` feature computes only the lowest `k` modes directly; without
+        // it `k_modes` still works, via a full dense solve truncated to those modes.
+        #[cfg(feature = "sparse")]
         if let Some(k) = params.k_modes {
             return Self::solve_partial(&net, params, k, atoms.len());
         }
 
         let h = build_hessian(net.keep.len(), &net.weights, &net.contacts, params);
         let spectrum = eigen::solve(h);
-        Ok(Self::from_modes(
-            spectrum.eigenvalues,
-            &spectrum.eigenvectors,
-            &net,
-            atoms.len(),
-        ))
+        match params.k_modes {
+            None => Ok(Self::from_modes(
+                spectrum.eigenvalues,
+                &spectrum.eigenvectors,
+                &net,
+                atoms.len(),
+            )),
+            Some(k) => {
+                let columns = lowest_nonzero_columns(&spectrum.eigenvalues, k);
+                let eigenvalues = columns.iter().map(|&c| spectrum.eigenvalues[c]).collect();
+                let vectors = pick_columns(&spectrum.eigenvectors, &columns);
+                Ok(Self::from_modes(eigenvalues, &vectors, &net, atoms.len()))
+            }
+        }
     }
 
     /// The `k` lowest non-zero modes via the sparse partial solver.
@@ -342,13 +370,6 @@ impl NormalModes {
         Ok(Self::from_modes(eigenvalues, &vectors, net, n_original))
     }
 
-    /// Without the `sparse` feature there is no partial solver, so `k_modes` is
-    /// an explicit error rather than a silent dense solve.
-    #[cfg(not(feature = "sparse"))]
-    const fn solve_partial(_: &Network, _: &Params, _: usize, _: usize) -> Result<Self, Error> {
-        Err(Error::SparseFeatureRequired)
-    }
-
     /// Group atoms into rigid blocks (the Rotation-Translation Blocks method)
     /// and solve the reduced eigenproblem.
     ///
@@ -362,8 +383,9 @@ impl NormalModes {
     /// block it reduces exactly to [`new`](Self::new).
     ///
     /// With [`Params::k_modes`] set, only the lowest `k` non-zero modes are
-    /// computed, via a matrix-free partial solver that never forms the reduced
-    /// matrix (requires the `sparse` feature).
+    /// returned. The `sparse` feature computes them with a matrix-free partial
+    /// solver that never forms the reduced matrix; without it they come from a
+    /// full dense reduction.
     pub fn with_blocks(atoms: &[Atom], blocks: &[usize], params: &Params) -> Result<Self, Error> {
         if blocks.len() != atoms.len() {
             return Err(Error::BlockCountMismatch);
@@ -372,19 +394,30 @@ impl NormalModes {
         // The drop carries the blocks along: a block keeps only its connected atoms.
         let blocks: Vec<usize> = net.keep.iter().map(|&old| blocks[old]).collect();
 
+        #[cfg(feature = "sparse")]
         if let Some(k) = params.k_modes {
             return Self::solve_rtb_partial(&net, &blocks, params, k, atoms.len());
         }
 
         let h = build_hessian(net.keep.len(), &net.weights, &net.contacts, params);
-        // Reduce to the block subspace, solve there, then lift modes back with P.
-        // `tr_mul` forms Pᵀ·(H·P) without materializing the transpose of P.
+        // Reduce to the block subspace and solve there; `tr_mul` forms Pᵀ·(H·P)
+        // without materializing the transpose of P.
         let p = rtb::projection(&net.positions, &net.weights, &blocks)?;
-        let reduced = p.tr_mul(&(&h * &p));
-        let spectrum = eigen::solve(reduced);
-        let all_atom = &p * &spectrum.eigenvectors;
-        let rtb = Self::build_rtb(&net, &blocks, spectrum.eigenvectors)?;
-        let mut modes = Self::from_modes(spectrum.eigenvalues, &all_atom, &net, atoms.len());
+        let reduced_hessian = p.tr_mul(&(&h * &p));
+        let spectrum = eigen::solve(reduced_hessian);
+        // Keep all modes, or — the dense `k_modes` fallback — the lowest k non-zero.
+        let (eigenvalues, reduced) = match params.k_modes {
+            None => (spectrum.eigenvalues, spectrum.eigenvectors),
+            Some(k) => {
+                let columns = lowest_nonzero_columns(&spectrum.eigenvalues, k);
+                let eigenvalues = columns.iter().map(|&c| spectrum.eigenvalues[c]).collect();
+                (eigenvalues, pick_columns(&spectrum.eigenvectors, &columns))
+            }
+        };
+        // Lift the reduced modes back with P, and keep them for nonlinear modes.
+        let all_atom = &p * &reduced;
+        let rtb = Self::build_rtb(&net, &blocks, reduced)?;
+        let mut modes = Self::from_modes(eigenvalues, &all_atom, &net, atoms.len());
         modes.rtb = Some(rtb);
         Ok(modes)
     }
@@ -410,17 +443,6 @@ impl NormalModes {
         let mut modes = Self::from_modes(eigenvalues, &vectors, net, n_original);
         modes.rtb = Some(rtb);
         Ok(modes)
-    }
-
-    #[cfg(not(feature = "sparse"))]
-    const fn solve_rtb_partial(
-        _: &Network,
-        _: &[usize],
-        _: &Params,
-        _: usize,
-        _: usize,
-    ) -> Result<Self, Error> {
-        Err(Error::SparseFeatureRequired)
     }
 
     /// Repackage an eigendecomposition (columns = modes, rows = `3·keep.len()`
@@ -1108,21 +1130,39 @@ mod tests {
         ));
     }
 
-    /// Without the `sparse` feature, requesting `k_modes` is an explicit error
-    /// rather than a silent dense solve — on both constructors.
+    /// Without the `sparse` feature, `k_modes` falls back to a dense solve and
+    /// returns the same lowest `k` non-zero modes the full solve would — on both
+    /// constructors. (With `sparse` the same is checked against the partial
+    /// solver in `tests/sparse.rs`.)
     #[cfg(not(feature = "sparse"))]
     #[test]
-    fn k_modes_requires_sparse_feature() {
+    fn k_modes_falls_back_to_dense() {
         let atoms = cluster6();
         let mut params = rtb_params();
         params.k_modes = Some(2);
-        assert!(matches!(
-            NormalModes::new(&atoms, &params),
-            Err(Error::SparseFeatureRequired)
-        ));
-        assert!(matches!(
-            NormalModes::with_blocks(&atoms, &[0, 0, 0, 1, 1, 1], &params),
-            Err(Error::SparseFeatureRequired)
-        ));
+
+        let lowest_two = |full: &NormalModes| -> Vec<f64> {
+            full.eigenvalues()
+                .iter()
+                .filter(|&&v| v > ZERO_EIGENVALUE)
+                .take(2)
+                .copied()
+                .collect()
+        };
+
+        let plain = NormalModes::new(&atoms, &params).unwrap();
+        assert_eq!(plain.len(), 2);
+        let plain_full = NormalModes::new(&atoms, &rtb_params()).unwrap();
+        for (got, want) in plain.eigenvalues().iter().zip(lowest_two(&plain_full)) {
+            assert_relative_eq!(got, &want, epsilon = 1e-9);
+        }
+
+        let blocks = [0, 0, 0, 1, 1, 1];
+        let rtb = NormalModes::with_blocks(&atoms, &blocks, &params).unwrap();
+        assert_eq!(rtb.len(), 2);
+        let rtb_full = NormalModes::with_blocks(&atoms, &blocks, &rtb_params()).unwrap();
+        for (got, want) in rtb.eigenvalues().iter().zip(lowest_two(&rtb_full)) {
+            assert_relative_eq!(got, &want, epsilon = 1e-9);
+        }
     }
 }
