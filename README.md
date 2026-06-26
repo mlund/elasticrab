@@ -76,6 +76,16 @@ Every result is validated against independent references; `cargo test` runs:
 See [`docs/PEPSI_COMPARISON.md`](docs/PEPSI_COMPARISON.md) for how the crate
 relates to Pepsi-SAXS / NOLB.
 
+## Visualizing a mode
+
+`NormalModes::displace(positions, i, amplitude)` returns the structure pushed
+along mode `i` — sweep `amplitude` to make a trajectory you can watch. The
+`animate_pdb` example turns a mode into a multi-model PDB for PyMOL or VMD:
+
+```sh
+cargo run --example animate_pdb -- protein.pdb > mode6.pdb   # args: [amplitude] [mode] [frames]
+```
+
 ## Benchmarks
 
 `cargo bench` compares the dense and sparse solvers, with and without rigid

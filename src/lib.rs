@@ -449,6 +449,37 @@ impl NormalModes {
         &self.modes[i * self.n_atoms..(i + 1) * self.n_atoms]
     }
 
+    /// New positions with the atoms pushed along mode `i` by `amplitude`:
+    /// `xₐ + amplitude · vᵢ(a)` for each atom `a`. Disconnected atoms (zero in the
+    /// mode) stay put. Sweep `amplitude` and write each result as a frame to
+    /// animate the mode — see the `animate_pdb` example.
+    ///
+    /// This is the *linear* displacement; at large amplitude it stretches bonds,
+    /// which is fine for small-amplitude visualization (NOLB's non-linear,
+    /// bond-preserving variant is not implemented).
+    ///
+    /// # Panics
+    /// If `i >= self.len()`, or `positions.len()` is not the original atom count.
+    pub fn displace(&self, positions: &[[f64; 3]], i: usize, amplitude: f64) -> Vec<[f64; 3]> {
+        let mode = self.eigenvector(i);
+        assert_eq!(
+            positions.len(),
+            mode.len(),
+            "positions must have one entry per atom"
+        );
+        positions
+            .iter()
+            .zip(mode)
+            .map(|(x, v)| {
+                [
+                    x[0] + amplitude * v[0],
+                    x[1] + amplitude * v[1],
+                    x[2] + amplitude * v[2],
+                ]
+            })
+            .collect()
+    }
+
     /// Original indices of atoms dropped from the analysis for being
     /// disconnected — no spring within the cutoff (degree 0). Empty for a fully
     /// connected network. A dropped atom's entry is `[0, 0, 0]` in every mode.
@@ -801,6 +832,40 @@ mod tests {
             NormalModes::new(&atoms, &rtb_params()),
             Err(Error::TooFewAtoms)
         ));
+    }
+
+    // --- Mode displacement (visualization) ---
+
+    /// Displacing by `a` shifts every atom by `a·vᵢ`; amplitude 0 is the identity.
+    #[test]
+    fn displace_shifts_atoms_along_the_mode() {
+        let atoms = cluster6();
+        let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
+        let modes = NormalModes::new(&atoms, &rtb_params()).unwrap();
+
+        assert_eq!(modes.displace(&positions, 6, 0.0), positions);
+
+        let (i, a) = (6, 0.5); // mode 6 is the first non-zero (internal) mode
+        let moved = modes.displace(&positions, i, a);
+        let mode = modes.eigenvector(i);
+        for (got, (orig, v)) in moved.iter().zip(positions.iter().zip(mode)) {
+            for c in 0..3 {
+                assert_relative_eq!(got[c], orig[c] + a * v[c], epsilon = 1e-12);
+            }
+        }
+        assert!(moved.iter().zip(&positions).any(|(g, o)| g != o));
+    }
+
+    /// A dropped (disconnected) atom is zero in every mode, so it never moves.
+    #[test]
+    fn displace_leaves_disconnected_atom_fixed() {
+        let mut atoms = cluster6();
+        atoms.push(carbon(100.0, 100.0, 100.0));
+        let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
+        let modes = NormalModes::new(&atoms, &rtb_params()).unwrap();
+
+        let moved = modes.displace(&positions, 6, 5.0);
+        assert_eq!(moved[6], positions[6]);
     }
 
     /// Without the `sparse` feature, requesting `k_modes` is an explicit error
