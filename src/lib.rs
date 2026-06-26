@@ -72,8 +72,9 @@ pub struct Atom {
 pub struct Params {
     /// Maximum distance (ångström) for two atoms to be joined by a spring.
     pub cutoff: f64,
-    /// Uniform spring constant. Scales all eigenvalues linearly, so its
-    /// absolute value only matters relative to how you interpret the output.
+    /// Uniform spring constant. It scales every eigenvalue by the same factor, so
+    /// its value only sets the overall scale; the mode shapes and the ratios
+    /// between eigenvalues do not depend on it.
     pub gamma: f64,
     /// When true, diagonalize the mass-weighted Hessian `M^{-1/2} H M^{-1/2}`
     /// instead of `H`; eigenvalues are then squared frequencies `ω²`.
@@ -321,9 +322,7 @@ impl NormalModes {
     /// Build the ANM Hessian for `atoms` and diagonalize it.
     ///
     /// Heavy and fallible by design — it assembles a `3N×3N` matrix and runs a
-    /// symmetric eigendecomposition. Named `new` to match the decomposition
-    /// constructors of the numeric ecosystem it builds on (nalgebra's
-    /// `SymmetricEigen::new`, and `Regex::new`).
+    /// symmetric eigendecomposition.
     pub fn new(atoms: &[Atom], params: &Params) -> Result<Self, Error> {
         let net = prepare(atoms, params)?;
 
@@ -495,7 +494,8 @@ impl NormalModes {
         self.eigenvalues.len()
     }
 
-    /// Whether there are no modes (only possible for an empty result).
+    /// Whether there are no modes — always false for a successful solve, provided
+    /// as the conventional companion to [`len`](Self::len).
     pub const fn is_empty(&self) -> bool {
         self.eigenvalues.is_empty()
     }
@@ -519,9 +519,9 @@ impl NormalModes {
     /// mode) stay put. Sweep `amplitude` and write each result as a frame to
     /// animate the mode — see the `animate_pdb` example.
     ///
-    /// This is the *linear* displacement; at large amplitude it stretches bonds,
-    /// which is fine for small-amplitude visualization (NOLB's non-linear,
-    /// bond-preserving variant is not implemented).
+    /// This is the *linear* displacement; at large amplitude it stretches bonds.
+    /// For the bond-preserving variant, see
+    /// [`displace_nonlinear`](Self::displace_nonlinear).
     ///
     /// # Panics
     /// If `i >= self.len()`, or `positions.len()` is not the original atom count.
