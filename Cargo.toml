@@ -1,12 +1,19 @@
 [package]
 name = "elasticrab"
 version = "0.1.0"
+authors = ["Mikael Lund"]
 edition = "2021"
 license = "Apache-2.0"
 description = "Anisotropic Network Model (ANM) normal-mode analysis: atoms in, frequencies and modes out."
-repository = "https://github.com/mikael/elasticrab"
+repository = "https://github.com/mlund/elasticrab"
+documentation = "https://docs.rs/elasticrab"
+readme = "README.md"
 keywords = ["normal-modes", "anm", "elastic-network", "biophysics", "nma"]
 categories = ["science"]
+
+# Build docs.rs with every feature so the SIMD/parallel paths are documented.
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 # Partial eigensolver for the lowest non-zero modes, and a SIMD dense solver.
