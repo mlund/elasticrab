@@ -50,10 +50,19 @@ the public API.
 
 ## Testing
 
-`cargo test` runs unit/property tests, analytic mass-weighting checks (diatomic
-reduced-mass relation), and a golden test against ProDy. See
-[`docs/PEPSI_COMPARISON.md`](docs/PEPSI_COMPARISON.md) for why the Pepsi-SAXS
-binary is *not* used as a weighted reference oracle.
+`cargo test` runs:
+
+- **Unit & property tests** — Hessian symmetry, rigid-body null space, RTB DOF
+  accounting, error paths.
+- **Analytic mass-weighting checks** — the diatomic reduced-mass relation
+  `ω² = γ(1/m₁ + 1/m₂)` and the equal-mass scaling invariant.
+- **ProDy golden tests** — exact spectrum match for the plain ANM (1UBI) and the
+  RTB reduction (2GB1).
+- **NOLB golden test** — mass-weighted RTB against the authentic engine, via
+  vendored crambin fixtures (the binary is not needed at test time).
+
+See [`docs/PEPSI_COMPARISON.md`](docs/PEPSI_COMPARISON.md) for how the crate
+relates to Pepsi-SAXS / NOLB.
 
 ## License
 

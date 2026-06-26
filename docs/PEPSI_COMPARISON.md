@@ -1,100 +1,83 @@
-# Why Pepsi-SAXS is not used as a weighted reference oracle
+# How elasticrab relates to Pepsi-SAXS and NOLB
 
-`elasticrab` validates its **unit-mass** ANM against ProDy (an exact, per-atom
-match). It was natural to ask whether the Pepsi-SAXS binary could serve as the
-reference oracle for the **mass-weighted** path. Empirically, it cannot — the
-two compute structurally different models. This note records what was found by
-running `~/bin/Pepsi-SAXS` (v2.6, 29 Jan 2020).
+Pepsi-SAXS computes normal modes with the NOLB engine (Grudinin's NOn-Linear
+rigid Block method). NOLB does **not** run a plain per-atom ANM: it reduces a
+mass-weighted all-atom Hessian to per-residue rigid blocks (RTB) before solving.
+elasticrab implements that same RTB model and reproduces both ProDy's and NOLB's
+reference spectra exactly. This note records the evidence, gathered by running
+`~/bin/Pepsi-SAXS` (v2.6, 29 Jan 2020) and `~/Downloads/NOLB` (v1.1).
 
-## How Pepsi's NMA was invoked
+## What Pepsi and NOLB compute
+
+Running Pepsi's NMA on crambin (PDB 1EJG, 46 residues, 327 heavy atoms):
 
 ```
-# theoretical curve, fed back as the "experimental" curve to enable --opt
+# feed Pepsi's own theoretical curve back as the "experimental" curve to enable --opt
 Pepsi-SAXS crambin.pdb -o theo.out
 Pepsi-SAXS crambin.pdb exp.dat --opt --modes 10 --useMasses
 ```
 
-`--opt` (flexible optimization) enables the NMA path; it requires an
-experimental curve. `--useMasses` turns on mass-weighting (off by default in
-this build). `GAMMA` is fixed at 1.0; the cutoff defaults to 5 Å.
-
-## What the log revealed (crambin, PDB 1EJG: 46 residues, 327 atoms)
+`--opt` enables the NMA path and needs a curve; `--useMasses` turns on
+mass-weighting; γ = 1 and the cutoff defaults to 5 Å. The log shows:
 
 ```
-All-atom Hessian size :     981 x 981      # 3 × 327 atoms — NO hydration nodes added
+All-atom Hessian size :     981 x 981      # 3 × 327 atoms
 Reduced Hessian size :      276 x 276      # 6 DOF × 46 residues
 Warning: Did not converge, increasing nModes to ...
 ```
 
-Three findings:
+Three things follow:
 
-1. **Per-residue RTB reduction.** The all-atom Hessian (981 = 3·327) is reduced
-   to 276 = 6·46 before solving — six rigid-body DOF per residue, i.e. one
-   Rotation-Translation Block per residue. The block file format keys on
-   *residue* IDs (`cSAS.cpp` block reader), so blocks can never be finer than a
-   residue. Pepsi therefore reports **RTB modes**, not per-atom ANM modes.
+1. **Per-residue RTB reduction.** The 981×981 all-atom Hessian reduces to
+   276 = 6·46 before solving — six rigid-body DOF per residue. The block-file
+   reader keys on residue IDs (`cSAS.cpp`), so blocks never go finer than a
+   residue. Pepsi reports RTB modes, not per-atom ANM modes.
+2. **Iterative solver.** "Did not converge, increasing nModes" reveals an
+   iterative partial eigensolver (lowest-*k* modes), not a dense decomposition.
+3. **No hydration nodes.** 981 = 3·327 matches the heavy-atom count exactly, so
+   this build adds no water pseudo-atoms to the network (unlike the newer source
+   tree).
 
-2. **Iterative/sparse solver.** "Did not converge, increasing nModes" shows an
-   iterative partial eigensolver (lowest-*k* modes), not a dense full
-   decomposition. (This also answers an open design question: Pepsi is *not*
-   dense.)
+## Why a per-atom ANM cannot be compared naively
 
-3. **No hydration nodes in this build's NMA.** 981 = 3·327 equals the heavy-atom
-   count exactly, so — unlike the newer Pepsi source tree — this binary does not
-   add water pseudo-atoms to the elastic network.
+elasticrab's plain ANM and Pepsi's RTB are different models, so their
+frequencies are different quantities and no tolerance makes them agree. Forcing
+Pepsi onto a per-atom grid fails outright: a Cα model gives each RTB block a
+single point with zero rotational inertia, and the inertia inverse-square-root
+then divides by zero (`SIGSEGV`). The answer is not to coerce Pepsi but to
+implement RTB in elasticrab.
 
-## Why a direct comparison is impossible
+## elasticrab implements RTB — validated against ProDy and NOLB
 
-- **CA-only input segfaults.** Forcing one atom per residue (a Cα model) makes
-  each RTB block a single point with zero rotational inertia; the inertia-tensor
-  inverse-square-root in the block construction divides by zero → `SIGSEGV`.
-  So Pepsi cannot be coerced into a per-atom spectrum.
-- **RTB ≠ ANM.** elasticrab is a per-atom ANM; Pepsi's reported frequencies come
-  from a per-residue RTB projection of a mass-weighted all-atom Hessian. The
-  eigenvalues are not the same quantities, so no tolerance makes them agree.
+`NormalModes::with_blocks` adds the per-residue RTB reduction, checked two ways:
 
-Reproducing Pepsi's numbers would require implementing all-atom Hessian
-construction **plus** RTB projection **plus** mass-weighting in elasticrab —
-i.e. re-implementing Pepsi's (external NOLB) engine, which is explicitly out of
-scope for this library.
+- **`tests/prody_rtb.rs` (unit-mass, exact).** The eigenvalue spectrum of our
+  reduced Hessian `Pᵀ H P` matches ProDy's reference `rtb2gb1_hessian.coo`. We
+  compare spectra, not matrices: a block's rotational basis is fixed only up to
+  orientation, so `Pᵀ H P` is basis-dependent while its eigenvalues are not.
+- **`tests/nolb_rtb.rs` (mass-weighted, authentic engine).** Our spectrum
+  matches NOLB's frequencies for heavy-atom crambin.
 
-## What we validate instead
+### Reconciling with NOLB
 
-- **Unit-mass path** → exact golden test vs ProDy's 1UBI Hessian + eigenvalues.
-- **Mass-weighted path** → analytic checks: the diatomic reduced-mass relation
-  `ω² = γ(1/m₁ + 1/m₂)`, and the equal-mass invariant `spectrum(M=mI) =
-  spectrum(unit)/m`.
+The NOLB User Guide (v1.1) settles every convention: equations §1.2–1.5 spell
+out exactly the model we implemented — mass-weighted stiffness
+`K_w = M^{-1/2} K M^{-1/2}`, frequency `√λ`, translation columns `√(mₖ/M_b)`,
+rotation columns `√mₖ · I^{-1/2} · [rₖ − r_COM]×`, reduced as `Pᵀ K_w P`.
+elasticrab's RTB is therefore identical to NOLB's by construction.
 
-If per-residue RTB is wanted in the future, the right reference oracle is
-ProDy's own `RTB` class (it ships `rtb2gb1` fixtures), not the Pepsi binary.
+Two bookkeeping differences remained, both now resolved:
 
-## RTB is now implemented — and the oracle is ProDy, not the binary
+- **Hydrogens.** NOLB reads 742 atoms for crambin because it keeps hydrogens.
+  The test feeds NOLB and elasticrab the same heavy-atom structure
+  (`crambin_heavy.pdb`, 327 atoms), removing the difference.
+- **Unit constant.** NOLB scales its frequency by a fixed factor (empirically
+  1/√1000), so the test compares the spectra for proportionality, not absolute
+  value.
 
-`NormalModes::with_blocks` adds the per-residue RTB reduction. It is validated by
-`tests/prody_rtb.rs`: the eigenvalue spectrum of our reduced Hessian `Pᵀ H P`
-matches ProDy's reference `rtb2gb1_hessian.coo` exactly. Spectra are compared
-(not the matrices) because a block's rotational basis is only defined up to
-orientation, so `Pᵀ H P` is basis-dependent while its eigenvalues are not.
-
-### Why not assert against the NOLB binary directly
-
-NOLB (`~/Downloads/NOLB`, the authentic Grudinin engine Pepsi wraps) *can*
-generate RTB fixtures — it is ARPACK-based (lowest-k, confirmed), takes a rigid
-block file (`--blocks`, new format `chain:start:end` intervals, e.g. `A1:8`), and
-emits frequencies as JSON (`-j`, under `["Doing NMA"]["Frequencies"]["value"]`).
-For crambin it gives a clean run (`-n 10 -c 5`):
-
-```
-0.006593 0.006788 0.008845 0.009876 0.010521 0.011923 0.012043 0.013044 0.013821 0.013881
-```
-
-But an *exact* cross-check is brittle, because matching NOLB means matching every
-one of its engine conventions, several of them surprising:
-- it reads **742 atoms** for crambin (it keeps hydrogens; Pepsi kept 327);
-- it reports a **null-space of 2**, not the textbook 6;
-- its own mass set and frequency definition (`√λ` up to an unknown constant).
-
-A scale-invariant comparison doesn't rescue this, since relative frequency
-spacing depends on those mass/hydrogen choices. So NOLB confirms the *model* we
-implemented and is recorded here as a reference, but the committed assertion uses
-ProDy's exact, self-contained `rtb2gb1` fixtures.
+Agreement is then essentially exact: across the 10 lowest non-zero modes, the
+elasticrab/NOLB ratio is constant to ~6 digits. elasticrab's raw `√λ` (0.08155,
+0.08853, …) also reproduces the Pepsi frequencies (0.0815544, 0.0885307) to five
+figures, since Pepsi reports `√λ` without NOLB's constant. The reference
+frequencies are vendored (`nolb_crambin_freqs.txt`), so the test never runs the
+binary.

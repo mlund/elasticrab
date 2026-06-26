@@ -1,0 +1,22 @@
+# NOLB reference RTB frequencies for heavy-atom crambin (crambin_heavy.pdb).
+#
+# Generated with the authentic NOLB engine (the one Pepsi-SAXS wraps):
+#   NOLB crambin_heavy.pdb -n 10 -c 5 -j
+# version 1.1 (December 2018); default per-residue rigid blocks, mass-weighted,
+# 5 Å cutoff. Frequencies are the 10 lowest non-zero modes, read from the JSON
+# log at ["Doing NMA"]["Frequencies"]["value"].
+#
+# NOLB reports frequency = sqrt(eigenvalue of the mass-weighted, RTB-reduced
+# Hessian) times a fixed global unit constant (~1/sqrt(1000)). elasticrab's raw
+# sqrt(eigenvalue) therefore matches these up to that single constant — which is
+# why the test compares the spectra for *proportionality*, not absolute value.
+0.00257897761256193
+0.0027995863072959575
+0.003336049608081399
+0.00398301051592219
+0.004361066618901736
+0.0047611759878796985
+0.005332788181276138
+0.005502253023777605
+0.005819689428083173
+0.005917566535288491
