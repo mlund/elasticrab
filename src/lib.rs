@@ -46,6 +46,8 @@ mod sparse;
 
 use nalgebra::DMatrix;
 
+use network::Contact;
+
 /// A point mass in the elastic network.
 ///
 /// `mass` is in arbitrary units and is **ignored** unless
@@ -144,6 +146,8 @@ pub struct NormalModes {
     /// `modes[k * n_atoms .. (k + 1) * n_atoms]`, one `[f64; 3]` per atom.
     modes: Vec<[f64; 3]>,
     n_atoms: usize,
+    /// Original indices of atoms dropped for being disconnected (degree 0).
+    disconnected: Vec<usize>,
 }
 
 /// Eigenvalues at or below this magnitude are treated as rigid-body (zero)
@@ -178,15 +182,97 @@ fn validated_inputs(atoms: &[Atom], params: &Params) -> Result<(Vec<[f64; 3]>, V
     Ok((positions, weights))
 }
 
-/// Assemble the all-atom ANM Hessian, mass-weighted when requested. `weights`
-/// equals the atomic masses on the mass-weighted path and is otherwise unused.
-fn build_hessian(positions: &[[f64; 3]], weights: &[f64], params: &Params) -> DMatrix<f64> {
-    let contacts = network::contacts(positions, params.cutoff);
-    let mut h = hessian::build(positions.len(), params.gamma, &contacts);
+/// Assemble the all-atom ANM Hessian from precomputed contacts, mass-weighted
+/// when requested. `weights` equals the atomic masses on the mass-weighted path
+/// and is otherwise unused.
+fn build_hessian(
+    n_atoms: usize,
+    weights: &[f64],
+    contacts: &[Contact],
+    params: &Params,
+) -> DMatrix<f64> {
+    let mut h = hessian::build(n_atoms, params.gamma, contacts);
     if params.mass_weighted {
         hessian::mass_weight(&mut h, weights);
     }
     h
+}
+
+/// The connected elastic network, ready to solve: positions, weights, and
+/// contacts renumbered to the atoms a spring actually touches. `keep[p]` is the
+/// original index of kept atom `p`; `disconnected` lists the degree-0 atoms that
+/// were removed (empty for a fully connected structure).
+struct Network {
+    positions: Vec<[f64; 3]>,
+    weights: Vec<f64>,
+    contacts: Vec<Contact>,
+    keep: Vec<usize>,
+    disconnected: Vec<usize>,
+}
+
+/// Validate the atoms, build the cell-list contacts, and drop disconnected atoms
+/// — the shared front half of both constructors. Fails if fewer than two atoms
+/// remain connected.
+fn prepare(atoms: &[Atom], params: &Params) -> Result<Network, Error> {
+    let (positions, weights) = validated_inputs(atoms, params)?;
+    let contacts = network::contacts(&positions, params.cutoff);
+    let net = drop_disconnected(positions, weights, contacts);
+    if net.keep.len() < 2 {
+        return Err(Error::TooFewAtoms);
+    }
+    Ok(net)
+}
+
+/// Remove atoms that no spring touches (degree 0). A fully connected network is
+/// returned unchanged with the identity `keep`, so the common case copies
+/// nothing.
+fn drop_disconnected(
+    positions: Vec<[f64; 3]>,
+    weights: Vec<f64>,
+    contacts: Vec<Contact>,
+) -> Network {
+    let n = positions.len();
+    let disconnected = network::disconnected_atoms(n, &contacts);
+    if disconnected.is_empty() {
+        return Network {
+            positions,
+            weights,
+            contacts,
+            keep: (0..n).collect(),
+            disconnected,
+        };
+    }
+
+    let mut dropped = vec![false; n];
+    for &d in &disconnected {
+        dropped[d] = true;
+    }
+    let mut new_index = vec![usize::MAX; n];
+    let mut keep = Vec::with_capacity(n - disconnected.len());
+    for old in 0..n {
+        if !dropped[old] {
+            new_index[old] = keep.len();
+            keep.push(old);
+        }
+    }
+
+    // Disconnected atoms have no contacts, so both endpoints are always kept.
+    let contacts = contacts
+        .into_iter()
+        .map(|c| Contact {
+            i: new_index[c.i],
+            j: new_index[c.j],
+            delta: c.delta,
+            dist2: c.dist2,
+        })
+        .collect();
+    Network {
+        positions: keep.iter().map(|&old| positions[old]).collect(),
+        weights: keep.iter().map(|&old| weights[old]).collect(),
+        contacts,
+        keep,
+        disconnected,
+    }
 }
 
 impl NormalModes {
@@ -197,17 +283,18 @@ impl NormalModes {
     /// constructors of the numeric ecosystem it builds on (nalgebra's
     /// `SymmetricEigen::new`, and `Regex::new`).
     pub fn new(atoms: &[Atom], params: &Params) -> Result<Self, Error> {
-        let (positions, weights) = validated_inputs(atoms, params)?;
+        let net = prepare(atoms, params)?;
 
         if let Some(k) = params.k_modes {
-            return Self::solve_partial(&positions, &weights, params, k);
+            return Self::solve_partial(&net, params, k, atoms.len());
         }
 
-        let h = build_hessian(&positions, &weights, params);
+        let h = build_hessian(net.keep.len(), &net.weights, &net.contacts, params);
         let spectrum = eigen::solve(h);
         Ok(Self::from_modes(
             spectrum.eigenvalues,
             &spectrum.eigenvectors,
+            &net,
             atoms.len(),
         ))
     }
@@ -215,21 +302,25 @@ impl NormalModes {
     /// The `k` lowest non-zero modes via the sparse partial solver.
     #[cfg(feature = "sparse")]
     fn solve_partial(
-        positions: &[[f64; 3]],
-        weights: &[f64],
+        net: &Network,
         params: &Params,
         k: usize,
+        n_original: usize,
     ) -> Result<Self, Error> {
-        let contacts = network::contacts(positions, params.cutoff);
-        let (eigenvalues, vectors) =
-            sparse::lowest_nonzero_modes(positions.len(), params.gamma, weights, &contacts, k)?;
-        Ok(Self::from_modes(eigenvalues, &vectors, positions.len()))
+        let (eigenvalues, vectors) = sparse::lowest_nonzero_modes(
+            net.keep.len(),
+            params.gamma,
+            &net.weights,
+            &net.contacts,
+            k,
+        )?;
+        Ok(Self::from_modes(eigenvalues, &vectors, net, n_original))
     }
 
     /// Without the `sparse` feature there is no partial solver, so `k_modes` is
     /// an explicit error rather than a silent dense solve.
     #[cfg(not(feature = "sparse"))]
-    const fn solve_partial(_: &[[f64; 3]], _: &[f64], _: &Params, _: usize) -> Result<Self, Error> {
+    const fn solve_partial(_: &Network, _: &Params, _: usize, _: usize) -> Result<Self, Error> {
         Err(Error::SparseFeatureRequired)
     }
 
@@ -252,22 +343,25 @@ impl NormalModes {
         if blocks.len() != atoms.len() {
             return Err(Error::BlockCountMismatch);
         }
-        let (positions, weights) = validated_inputs(atoms, params)?;
+        let net = prepare(atoms, params)?;
+        // The drop carries the blocks along: a block keeps only its connected atoms.
+        let blocks: Vec<usize> = net.keep.iter().map(|&old| blocks[old]).collect();
 
         if let Some(k) = params.k_modes {
-            return Self::solve_rtb_partial(&positions, &weights, blocks, params, k);
+            return Self::solve_rtb_partial(&net, &blocks, params, k, atoms.len());
         }
 
-        let h = build_hessian(&positions, &weights, params);
+        let h = build_hessian(net.keep.len(), &net.weights, &net.contacts, params);
         // Reduce to the block subspace, solve there, then lift modes back with P.
         // `tr_mul` forms Pᵀ·(H·P) without materializing the transpose of P.
-        let p = rtb::projection(&positions, &weights, blocks)?;
+        let p = rtb::projection(&net.positions, &net.weights, &blocks)?;
         let reduced = p.tr_mul(&(&h * &p));
         let spectrum = eigen::solve(reduced);
         let all_atom = &p * spectrum.eigenvectors;
         Ok(Self::from_modes(
             spectrum.eigenvalues,
             &all_atom,
+            &net,
             atoms.len(),
         ))
     }
@@ -275,44 +369,63 @@ impl NormalModes {
     /// The `k` lowest non-zero RTB modes via the matrix-free partial solver.
     #[cfg(feature = "sparse")]
     fn solve_rtb_partial(
-        positions: &[[f64; 3]],
-        weights: &[f64],
+        net: &Network,
         blocks: &[usize],
         params: &Params,
         k: usize,
+        n_original: usize,
     ) -> Result<Self, Error> {
-        let contacts = network::contacts(positions, params.cutoff);
-        let (eigenvalues, vectors) =
-            sparse::lowest_rtb_modes(positions, weights, blocks, params.gamma, &contacts, k)?;
-        Ok(Self::from_modes(eigenvalues, &vectors, positions.len()))
+        let (eigenvalues, vectors) = sparse::lowest_rtb_modes(
+            &net.positions,
+            &net.weights,
+            blocks,
+            params.gamma,
+            &net.contacts,
+            k,
+        )?;
+        Ok(Self::from_modes(eigenvalues, &vectors, net, n_original))
     }
 
     #[cfg(not(feature = "sparse"))]
     const fn solve_rtb_partial(
-        _: &[[f64; 3]],
-        _: &[f64],
+        _: &Network,
         _: &[usize],
         _: &Params,
+        _: usize,
         _: usize,
     ) -> Result<Self, Error> {
         Err(Error::SparseFeatureRequired)
     }
 
-    /// Repackage an eigendecomposition (columns = modes, rows = `3·n_atoms`
-    /// Cartesian coordinates) into the flattened per-atom mode storage.
-    fn from_modes(eigenvalues: Vec<f64>, vectors: &DMatrix<f64>, n_atoms: usize) -> Self {
-        let mut modes = Vec::with_capacity(eigenvalues.len() * n_atoms);
-        for col in vectors.column_iter() {
-            modes.extend((0..n_atoms).map(|a| [col[3 * a], col[3 * a + 1], col[3 * a + 2]]));
+    /// Repackage an eigendecomposition (columns = modes, rows = `3·keep.len()`
+    /// Cartesian coordinates of the connected atoms) into per-atom storage
+    /// indexed by the *original* atoms. `net.keep[p]` is the original index of
+    /// solved atom `p`; disconnected atoms get a zero displacement in every mode.
+    /// With an identity `keep` (a fully connected network) this is a plain repack.
+    fn from_modes(
+        eigenvalues: Vec<f64>,
+        vectors: &DMatrix<f64>,
+        net: &Network,
+        n_original: usize,
+    ) -> Self {
+        let mut modes = vec![[0.0; 3]; eigenvalues.len() * n_original];
+        for (m, col) in vectors.column_iter().enumerate() {
+            let base = m * n_original;
+            for (p, &orig) in net.keep.iter().enumerate() {
+                modes[base + orig] = [col[3 * p], col[3 * p + 1], col[3 * p + 2]];
+            }
         }
         Self {
             eigenvalues,
             modes,
-            n_atoms,
+            n_atoms: n_original,
+            disconnected: net.disconnected.clone(),
         }
     }
 
-    /// Number of modes, equal to three times the atom count.
+    /// Number of modes: three per connected atom for the plain model, or the
+    /// reduced rigid-block degree-of-freedom count for
+    /// [`with_blocks`](Self::with_blocks).
     pub const fn len(&self) -> usize {
         self.eigenvalues.len()
     }
@@ -334,6 +447,15 @@ impl NormalModes {
     /// If `i >= self.len()`.
     pub fn eigenvector(&self, i: usize) -> &[[f64; 3]] {
         &self.modes[i * self.n_atoms..(i + 1) * self.n_atoms]
+    }
+
+    /// Original indices of atoms dropped from the analysis for being
+    /// disconnected — no spring within the cutoff (degree 0). Empty for a fully
+    /// connected network. A dropped atom's entry is `[0, 0, 0]` in every mode.
+    ///
+    /// This mirrors Pepsi-SAXS / NOLB, which exclude such atoms before solving.
+    pub fn disconnected(&self) -> &[usize] {
+        &self.disconnected
     }
 
     /// Thermal RMS amplitudes `√(2·k_B·T / λ_i)` per mode at temperature `T`
@@ -618,6 +740,67 @@ mod tests {
         let atoms = cluster6();
         let r = NormalModes::with_blocks(&atoms, &[0, 0, 1, 1, 1, 2], &rtb_params());
         assert!(matches!(r, Err(Error::DegenerateBlock)));
+    }
+
+    // --- Disconnected atoms (degree 0) ---
+
+    /// An isolated atom is dropped: it is reported, contributes nothing to any
+    /// mode, and the kept spectrum keeps only its six rigid-body modes.
+    #[test]
+    fn isolated_atom_is_dropped() {
+        let mut atoms = cluster6();
+        atoms.push(carbon(100.0, 100.0, 100.0)); // no neighbour within cutoff
+        let modes = NormalModes::new(&atoms, &rtb_params()).unwrap();
+
+        assert_eq!(modes.disconnected(), &[6]);
+        assert_eq!(modes.len(), 18); // 6 connected atoms × 3, not 21
+        for i in 0..modes.len() {
+            assert_eq!(modes.eigenvector(i)[6], [0.0, 0.0, 0.0]);
+        }
+        let zeros = modes
+            .eigenvalues()
+            .iter()
+            .filter(|&&v| v.abs() < ZERO_EIGENVALUE)
+            .count();
+        assert_eq!(zeros, 6); // not 9 — the isolated atom's spurious modes are gone
+
+        // The kept spectrum equals solving the six connected atoms alone.
+        let reference = NormalModes::new(&cluster6(), &rtb_params()).unwrap();
+        for (a, b) in modes.eigenvalues().iter().zip(reference.eigenvalues()) {
+            assert_relative_eq!(a, b, epsilon = 1e-9);
+        }
+    }
+
+    /// RTB drops the isolated atom's block and remaps the rest: the two real
+    /// blocks survive and match the same blocks solved without the dummy.
+    #[test]
+    fn isolated_atom_is_dropped_with_blocks() {
+        let mut atoms = cluster6();
+        atoms.push(carbon(100.0, 100.0, 100.0));
+        // Two 3-atom blocks over the cluster; the isolated atom is its own block.
+        let modes =
+            NormalModes::with_blocks(&atoms, &[0, 0, 0, 1, 1, 1, 2], &rtb_params()).unwrap();
+
+        assert_eq!(modes.disconnected(), &[6]);
+        assert_eq!(modes.len(), 12); // two 6-DOF blocks; the dummy block is gone
+        for i in 0..modes.len() {
+            assert_eq!(modes.eigenvector(i)[6], [0.0, 0.0, 0.0]);
+        }
+        let reference =
+            NormalModes::with_blocks(&cluster6(), &[0, 0, 0, 1, 1, 1], &rtb_params()).unwrap();
+        for (a, b) in modes.eigenvalues().iter().zip(reference.eigenvalues()) {
+            assert_relative_eq!(a, b, epsilon = 1e-9);
+        }
+    }
+
+    /// If every atom is isolated (nothing within cutoff) there is no network.
+    #[test]
+    fn all_atoms_disconnected_is_too_few() {
+        let atoms = [carbon(0.0, 0.0, 0.0), carbon(100.0, 0.0, 0.0)];
+        assert!(matches!(
+            NormalModes::new(&atoms, &rtb_params()),
+            Err(Error::TooFewAtoms)
+        ));
     }
 
     /// Without the `sparse` feature, requesting `k_modes` is an explicit error

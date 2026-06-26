@@ -3,6 +3,8 @@
 //! A contact is created between every pair of atoms closer than the cutoff;
 //! these are the springs whose geometry defines the Hessian.
 
+use std::collections::HashMap;
+
 /// A spring between two atoms, carrying the data the Hessian assembly needs so
 /// it never has to revisit the coordinates: the endpoint indices, the
 /// displacement `j - i`, and its squared length.
@@ -15,25 +17,117 @@ pub(crate) struct Contact {
 
 /// All atom pairs within `cutoff` of each other.
 ///
-/// Brute-force O(n²): every distinct pair is tested once (`i < j`). This is the
-/// deliberate simple choice — it is exact and trivially correct for the system
-/// sizes this crate targets. It lives behind this function precisely so a cell
-/// list can replace it later without touching anything downstream.
+/// A uniform cell list: atoms are binned into a grid of cutoff-sized cells, so
+/// each atom only has to be compared against the atoms in its own cell and the
+/// 26 around it — `O(n)` for the roughly uniform densities of molecular
+/// structures, where the brute-force `O(n²)` scan dominates large solvated
+/// systems. The result is exactly the brute-force contact set; only the order
+/// differs, which no consumer depends on (they all accumulate).
 pub(crate) fn contacts(positions: &[[f64; 3]], cutoff: f64) -> Vec<Contact> {
+    // A non-positive or NaN cutoff makes the grid spacing meaningless; fall back
+    // to the exact pairwise scan, which handles it correctly.
+    if cutoff <= 0.0 || cutoff.is_nan() {
+        return brute_force(positions, cutoff);
+    }
+
+    let grid = Grid::new(positions, cutoff);
     let cutoff2 = cutoff * cutoff;
     let mut out = Vec::new();
 
     for i in 0..positions.len() {
-        for j in (i + 1)..positions.len() {
-            let delta = [
-                positions[j][0] - positions[i][0],
-                positions[j][1] - positions[i][1],
-                positions[j][2] - positions[i][2],
-            ];
-            let dist2 = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
-            if dist2 <= cutoff2 {
-                out.push(Contact { i, j, delta, dist2 });
+        grid.for_each_candidate(positions[i], |j| {
+            // Each unordered pair is emitted once, by its lower-indexed atom.
+            if j > i {
+                out.extend(contact_within(positions, i, j, cutoff2));
             }
+        });
+    }
+    out
+}
+
+/// Indices of atoms that no contact touches. Such an atom has no spring, so its
+/// three coordinates are unconstrained and would add three spurious zero modes;
+/// the caller drops them before solving (matching Pepsi's `cAtomGrid`, which
+/// flags exactly the zero-neighbour atoms).
+pub(crate) fn disconnected_atoms(n_atoms: usize, contacts: &[Contact]) -> Vec<usize> {
+    let mut connected = vec![false; n_atoms];
+    for c in contacts {
+        connected[c.i] = true;
+        connected[c.j] = true;
+    }
+    (0..n_atoms).filter(|&a| !connected[a]).collect()
+}
+
+/// `b - a`, the displacement stored on a [`Contact`].
+fn displacement(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [b[0] - a[0], b[1] - a[1], b[2] - a[2]]
+}
+
+/// The contact between atoms `i` and `j`, if they lie within the cutoff. Shared
+/// by the cell list and the brute-force fallback so the distance test lives once.
+fn contact_within(positions: &[[f64; 3]], i: usize, j: usize, cutoff2: f64) -> Option<Contact> {
+    let delta = displacement(positions[i], positions[j]);
+    let dist2 = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
+    (dist2 <= cutoff2).then_some(Contact { i, j, delta, dist2 })
+}
+
+/// A uniform grid of cutoff-sized cells holding atom indices, stored sparsely so
+/// an elongated or mostly-empty bounding box costs nothing for the empty space.
+struct Grid {
+    cells: HashMap<[i64; 3], Vec<usize>>,
+    origin: [f64; 3],
+    cutoff: f64,
+}
+
+impl Grid {
+    fn new(positions: &[[f64; 3]], cutoff: f64) -> Self {
+        // Anchor the grid at the minimum corner so cell coordinates stay small.
+        let mut origin = [f64::INFINITY; 3];
+        for p in positions {
+            for axis in 0..3 {
+                origin[axis] = origin[axis].min(p[axis]);
+            }
+        }
+        let mut grid = Self {
+            cells: HashMap::new(),
+            origin,
+            cutoff,
+        };
+        for (atom, &p) in positions.iter().enumerate() {
+            grid.cells.entry(grid.cell_of(p)).or_default().push(atom);
+        }
+        grid
+    }
+
+    fn cell_of(&self, p: [f64; 3]) -> [i64; 3] {
+        std::array::from_fn(|axis| ((p[axis] - self.origin[axis]) / self.cutoff).floor() as i64)
+    }
+
+    /// Call `visit` with every atom in the cell of `p` and its 26 neighbours —
+    /// a superset of the atoms within `cutoff`, which the caller filters by
+    /// actual distance.
+    fn for_each_candidate(&self, p: [f64; 3], mut visit: impl FnMut(usize)) {
+        let [cx, cy, cz] = self.cell_of(p);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(atoms) = self.cells.get(&[cx + dx, cy + dy, cz + dz]) {
+                        atoms.iter().copied().for_each(&mut visit);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Exact `O(n²)` pairwise scan: the fallback for a degenerate cutoff and the
+/// oracle the cell list is tested against.
+fn brute_force(positions: &[[f64; 3]], cutoff: f64) -> Vec<Contact> {
+    let cutoff2 = cutoff * cutoff;
+    let mut out = Vec::new();
+    for i in 0..positions.len() {
+        for j in (i + 1)..positions.len() {
+            out.extend(contact_within(positions, i, j, cutoff2));
         }
     }
     out
@@ -58,5 +152,51 @@ mod tests {
     fn cutoff_is_inclusive() {
         let pos = [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]];
         assert_eq!(contacts(&pos, 2.0).len(), 1);
+    }
+
+    /// The cell list must return exactly the brute-force contact set. A
+    /// deterministic pseudo-random cloud spanning several cells exercises the
+    /// 27-cell stencil, including pairs that straddle cell boundaries.
+    #[test]
+    fn cell_list_matches_brute_force() {
+        let positions: Vec<[f64; 3]> = (0..400)
+            .map(|i| {
+                let f = i as f64;
+                [
+                    (f * 12.9898).sin() * 20.0,
+                    (f * 78.233).sin() * 20.0,
+                    (f * 37.719).sin() * 20.0,
+                ]
+            })
+            .collect();
+
+        for &cutoff in &[1.0, 3.5, 8.0] {
+            let mut fast: Vec<(usize, usize)> = contacts(&positions, cutoff)
+                .iter()
+                .map(|c| (c.i, c.j))
+                .collect();
+            let mut slow: Vec<(usize, usize)> = brute_force(&positions, cutoff)
+                .iter()
+                .map(|c| (c.i, c.j))
+                .collect();
+            fast.sort_unstable();
+            slow.sort_unstable();
+            assert_eq!(fast, slow, "cutoff {cutoff}");
+        }
+    }
+
+    #[test]
+    fn isolated_atom_is_disconnected() {
+        // Two atoms bonded, a third far away with no neighbour within cutoff.
+        let pos = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [50.0, 0.0, 0.0]];
+        let c = contacts(&pos, 1.5);
+        assert_eq!(disconnected_atoms(3, &c), vec![2]);
+    }
+
+    #[test]
+    fn fully_connected_has_no_disconnected_atoms() {
+        let pos = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let c = contacts(&pos, 1.5);
+        assert!(disconnected_atoms(3, &c).is_empty());
     }
 }

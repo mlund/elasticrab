@@ -81,3 +81,19 @@ elasticrab/NOLB ratio is constant to ~6 digits. elasticrab's raw `√λ` (0.0815
 figures, since Pepsi reports `√λ` without NOLB's constant. The reference
 frequencies are vendored (`nolb_crambin_freqs.txt`), so the test never runs the
 binary.
+
+### Disconnected atoms and the neighbour search
+
+Pepsi builds the Hessian with a cutoff-sized grid (`cAtomGrid`): one structure
+finds the spring pairs and flags atoms with no neighbour within the cutoff
+(`detectDisconnectedAtoms`), which it then drops (`computeIndices`: "don't need
+disconnected atoms"). NOLB does the same — its NMA output reports a "Number of
+disconnected atoms", built on the neighbour search of Artemova, Grudinin & Redon
+(2011).
+
+elasticrab mirrors both: `network::contacts` is a cell list (linear in the atom
+count), and atoms of degree 0 are dropped before solving and reported by
+`NormalModes::disconnected()`. The parity is tested directly —
+`crambin_heavy_isolated.pdb` (crambin plus one isolated carbon) makes NOLB report
+exactly one disconnected atom and return the crambin frequencies unchanged, and
+elasticrab drops the same atom and reproduces the same spectrum.

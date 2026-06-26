@@ -189,3 +189,27 @@ fn k_larger_than_spectrum_clamps() {
     assert!(modes.len() <= dof - 6);
     assert!(!modes.is_empty());
 }
+
+/// The partial solver drops an isolated atom before solving, recovering the
+/// connected spectrum exactly like the dense path.
+#[test]
+fn sparse_drops_disconnected_atom() {
+    let mut atoms = ubiquitin();
+    let isolated = atoms.len();
+    atoms.push(Atom {
+        position: [9999.0, 9999.0, 9999.0],
+        mass: 1.0,
+    });
+
+    let modes = partial(&atoms, 10, false);
+    assert_eq!(modes.disconnected(), &[isolated]);
+    assert_eq!(modes.len(), 10);
+
+    let reference = partial(&ubiquitin(), 10, false);
+    for (got, want) in modes.eigenvalues().iter().zip(reference.eigenvalues()) {
+        assert!(
+            (got - want).abs() < 1e-5 * want.max(1.0),
+            "with isolated {got:e} vs connected {want:e}"
+        );
+    }
+}

@@ -1,6 +1,6 @@
 # NOLB reference RTB frequencies for heavy-atom crambin (crambin_heavy.pdb).
 #
-# Generated with the authentic NOLB engine (the one Pepsi-SAXS wraps):
+# Generated with NOLB, the engine Pepsi-SAXS wraps:
 #   NOLB crambin_heavy.pdb -n 10 -c 5 -j
 # version 1.1 (December 2018); default per-residue rigid blocks, mass-weighted,
 # 5 Å cutoff. Frequencies are the 10 lowest non-zero modes, read from the JSON

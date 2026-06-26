@@ -43,6 +43,11 @@ constant), the same model that ProDy and Pepsi-SAXS use.
   systems (e.g. a solvated protein) too big to diagonalize, compute only the
   lowest *k* non-zero modes instead of the full spectrum — for both the plain and
   the rigid-block model.
+- **Disconnected atoms are dropped**: an atom with no neighbour within the cutoff
+  (say a stray water in a hydration shell) carries no spring, so it is removed
+  before solving and listed by `NormalModes::disconnected()` — the same handling
+  as Pepsi-SAXS / NOLB. The neighbour search is a cell list, linear in the atom
+  count.
 
 ## Scope
 
@@ -65,8 +70,8 @@ Every result is validated against independent references; `cargo test` runs:
 - **ProDy golden tests** — the spectrum matches ProDy's published reference
   exactly, for both the plain ANM (1UBI) and the rigid-block reduction (2GB1).
 - **NOLB golden test** — mass-weighted rigid blocks match NOLB, the engine
-  Pepsi-SAXS wraps (crambin). The reference values are vendored, so the test
-  reproduces without the binary.
+  Pepsi-SAXS wraps (crambin), including the disconnected-atom drop: adding an
+  isolated atom leaves the spectrum unchanged, exactly as NOLB reports it.
 
 See [`docs/PEPSI_COMPARISON.md`](docs/PEPSI_COMPARISON.md) for how the crate
 relates to Pepsi-SAXS / NOLB.
@@ -97,6 +102,12 @@ and get *slower* with more threads (sparse-medium is fastest at one core). So se
 `RAYON_NUM_THREADS` to roughly your core count for the dense path, and keep it low
 (1–2) for the partial solvers. Without any feature the dense solve uses nalgebra's
 scalar eigensolver, ~3× slower again.
+
+These numbers use the 15 Å cutoff conventional for Cα models. At the ~5 Å cutoff
+of all-atom models (as in Pepsi-SAXS), the network is far sparser and the same
+large partial solve drops to ~0.1 s — and there the cell-list neighbour search
+earns its keep: an O(n²) pairwise scan would otherwise dominate that cheap solve,
+while the cell list stays linear.
 
 ## License
 

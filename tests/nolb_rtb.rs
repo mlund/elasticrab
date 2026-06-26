@@ -86,3 +86,45 @@ fn mass_weighted_rtb_matches_nolb() {
         );
     }
 }
+
+/// Disconnected-atom parity with NOLB. `crambin_heavy_isolated.pdb` is crambin
+/// plus one isolated carbon (its own residue, far from the protein). Run on it,
+/// NOLB reports "Number of disconnected atoms : 1" and returns the *same* ten
+/// frequencies as crambin alone (verified: bit-identical to
+/// `nolb_crambin_freqs.txt`). elasticrab must likewise drop that atom and
+/// recover the crambin spectrum — so this reuses the crambin fixture.
+#[test]
+fn disconnected_atom_dropped_matches_nolb() {
+    let (atoms, blocks) =
+        read_atoms_and_residue_blocks(&format!("{DATA}/crambin_heavy_isolated.pdb"));
+    assert_eq!(atoms.len(), 328); // 327 crambin + 1 isolated carbon
+
+    let mut params = Params::default();
+    params.cutoff = 5.0;
+    params.mass_weighted = true;
+    let modes = NormalModes::with_blocks(&atoms, &blocks, &params).unwrap();
+
+    // The isolated atom (the last one) is dropped, exactly as NOLB drops it.
+    assert_eq!(modes.disconnected(), &[327]);
+    assert_eq!(modes.len(), 276); // 46 residue blocks × 6; the dummy block is gone
+
+    let eigenvalues = modes.eigenvalues();
+    let zeros = eigenvalues.iter().filter(|&&v| v.abs() < 1e-9).count();
+    assert_eq!(zeros, 6); // not 9 — the spurious modes of the isolated atom are gone
+
+    let ours: Vec<f64> = eigenvalues
+        .iter()
+        .filter(|&&v| v > 1e-9)
+        .take(10)
+        .map(|v| v.sqrt())
+        .collect();
+    let nolb = read_reference_freqs(&format!("{DATA}/nolb_crambin_freqs.txt"));
+    let scale = ours[0] / nolb[0];
+    for (k, (o, n)) in ours.iter().zip(&nolb).enumerate() {
+        let ratio = o / n;
+        assert!(
+            (ratio / scale - 1.0).abs() < 1e-3,
+            "mode {k}: ratio {ratio} deviates from global scale {scale}"
+        );
+    }
+}
