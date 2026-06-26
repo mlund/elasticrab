@@ -40,8 +40,10 @@ Pepsi-SAXS.
 - **Rigid blocks are opt-in** (`NormalModes::with_blocks`): the Rotation-Translation
   Blocks reduction used by Pepsi-SAXS/NOLB, validated against ProDy's reference.
 - **Partial solving is opt-in** (`sparse` feature + `Params::k_modes`): compute
-  only the lowest *k* non-zero modes from the sparse Hessian via shift-invert
-  Lanczos, for large systems (e.g. a solvated protein) too big to diagonalize.
+  only the lowest *k* non-zero modes, for large systems (e.g. a solvated protein)
+  too big to diagonalize. On `new` it uses shift-invert Lanczos on the sparse
+  Hessian; on `with_blocks` it uses **matrix-free RTB** — Lanczos on `Pᵀ K P`
+  applied with sparse mat-vecs, never forming the reduced matrix (NOLB's scheme).
 
 ## Scope
 
@@ -66,6 +68,21 @@ small and medium systems; the optional `sparse` feature adds a partial solver
 
 See [`docs/PEPSI_COMPARISON.md`](docs/PEPSI_COMPARISON.md) for how the crate
 relates to Pepsi-SAXS / NOLB.
+
+## Benchmarks
+
+`cargo bench --features sparse` compares the four solver paths on real Cα
+structures (lowest 10 modes). Indicative numbers (one machine; relative speedups
+are the point):
+
+| structure | dense all-atom | dense RTB | sparse partial | matrix-free RTB |
+|---|---|---|---|---|
+| **1A8I** (812 Cα) | 6.0 s | 1.5 s | 44 ms | 45 ms |
+| **1AON** (8015 Cα) | — (too large) | — | 1.2 s | 0.67 s |
+
+On the medium structure the partial solvers are **~135× faster** than dense
+all-atom and **~34× faster** than dense RTB; on the large one, where dense
+diagonalization is infeasible, matrix-free RTB finishes in well under a second.
 
 ## License
 

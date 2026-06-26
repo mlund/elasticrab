@@ -13,6 +13,9 @@ use nalgebra::{DMatrix, Matrix3, Vector3};
 
 use crate::Error;
 
+/// Sparse projection entries `(row, col, value)` plus the column count `nb6`.
+pub(crate) type ProjectionEntries = (Vec<(usize, usize, f64)>, usize);
+
 /// An inertia eigenvalue below this fraction of the block's largest means the
 /// block is rank-deficient (collinear or coincident atoms) and has no
 /// well-defined rotational basis.
@@ -31,16 +34,38 @@ pub(crate) fn projection(
     weights: &[f64],
     blocks: &[usize],
 ) -> Result<DMatrix<f64>, Error> {
-    let groups = group_by_block(blocks);
-    let nb6: usize = groups.iter().map(|g| block_dof(g.len())).sum();
-
+    let (entries, nb6) = projection_entries(positions, weights, blocks)?;
     let mut p = DMatrix::zeros(3 * positions.len(), nb6);
-    let mut col = 0;
-    for atoms in &groups {
-        block_columns(&mut p, positions, weights, atoms, col)?;
-        col += block_dof(atoms.len());
+    for (r, c, v) in entries {
+        p[(r, c)] = v;
     }
     Ok(p)
+}
+
+/// The projection as `(row, col, value)` triplets plus its column count `nb6`.
+/// Plain tuples (no matrix type) so both the dense [`projection`] and the sparse
+/// matrix-free solver can consume them.
+pub(crate) fn projection_entries(
+    positions: &[[f64; 3]],
+    weights: &[f64],
+    blocks: &[usize],
+) -> Result<ProjectionEntries, Error> {
+    let groups = group_by_block(blocks);
+    let nb6 = groups.iter().map(|g| block_dof(g.len())).sum();
+
+    let mut entries = Vec::new();
+    let mut col = 0;
+    for atoms in &groups {
+        block_columns(
+            &mut |r, c, v| entries.push((r, c, v)),
+            positions,
+            weights,
+            atoms,
+            col,
+        )?;
+        col += block_dof(atoms.len());
+    }
+    Ok((entries, nb6))
 }
 
 const fn block_dof(size: usize) -> usize {
@@ -65,10 +90,10 @@ fn group_by_block(blocks: &[usize]) -> Vec<Vec<usize>> {
     groups
 }
 
-/// Fill the translation (and, for multi-atom blocks, rotation) columns for one
-/// block starting at column `col`.
+/// Emit the translation (and, for multi-atom blocks, rotation) column entries
+/// for one block starting at column `col`, as `(row, col, value)` via `emit`.
 fn block_columns(
-    p: &mut DMatrix<f64>,
+    emit: &mut impl FnMut(usize, usize, f64),
     positions: &[[f64; 3]],
     weights: &[f64],
     atoms: &[usize],
@@ -88,7 +113,7 @@ fn block_columns(
     for &i in atoms {
         let s = weights[i].sqrt() / sqrt_total;
         for axis in 0..3 {
-            p[(3 * i + axis, col + axis)] = s;
+            emit(3 * i + axis, col + axis, s);
         }
     }
 
@@ -117,11 +142,11 @@ fn block_columns(
 
     for (&i, x) in atoms.iter().zip(&offsets) {
         let s = weights[i].sqrt();
-        for axis in 0..3 {
+        for (axis, generator) in generators.iter().enumerate() {
             // Displacement of atom i under rotation `axis` is generator × offset.
-            let rot = generators[axis].cross(x);
+            let rot = generator.cross(x);
             for coord in 0..3 {
-                p[(3 * i + coord, col + 3 + axis)] = s * rot[coord];
+                emit(3 * i + coord, col + 3 + axis, s * rot[coord]);
             }
         }
     }

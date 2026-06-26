@@ -21,6 +21,92 @@ fn partial(atoms: &[Atom], k: usize, mass_weighted: bool) -> NormalModes {
     NormalModes::new(atoms, &params).unwrap()
 }
 
+/// Group consecutive residues into rigid blocks of `size` Cα atoms each.
+fn blocks_of(n_atoms: usize, size: usize) -> Vec<usize> {
+    (0..n_atoms).map(|i| i / size).collect()
+}
+
+fn lowest_nonzero(modes: &NormalModes, k: usize) -> Vec<f64> {
+    modes
+        .eigenvalues()
+        .iter()
+        .filter(|&&v| v.abs() > 1e-6)
+        .take(k)
+        .copied()
+        .collect()
+}
+
+/// Matrix-free RTB (`with_blocks` + `k_modes`) must match the dense RTB solve's
+/// lowest non-zero modes.
+#[test]
+fn matrixfree_rtb_matches_dense_rtb() {
+    let atoms = ubiquitin();
+    let blocks = blocks_of(atoms.len(), 4); // 19 rigid blocks of 4 Cα
+    let k = 10;
+
+    let dense = NormalModes::with_blocks(&atoms, &blocks, &Params::default()).unwrap();
+    let dense_nonzero = lowest_nonzero(&dense, k);
+
+    let mut params = Params::default();
+    params.k_modes = Some(k);
+    let mf = NormalModes::with_blocks(&atoms, &blocks, &params).unwrap();
+
+    assert_eq!(mf.len(), k);
+    for (got, want) in mf.eigenvalues().iter().zip(&dense_nonzero) {
+        assert!(
+            (got - want).abs() < 1e-5 * want.max(1.0),
+            "matrix-free {got:e} vs dense RTB {want:e}"
+        );
+    }
+    assert!(mf.eigenvalues().iter().all(|&v| v > 1e-6));
+}
+
+/// With every atom its own block, `P` is the identity, so matrix-free RTB and
+/// the all-atom sparse solver compute the same lowest non-zero modes (via
+/// regular-mode and shift-invert Lanczos respectively).
+#[test]
+fn matrixfree_all_singleton_matches_all_atom_partial() {
+    let atoms = ubiquitin();
+    let singletons: Vec<usize> = (0..atoms.len()).collect();
+    let k = 10;
+
+    let mut params = Params::default();
+    params.k_modes = Some(k);
+    let rtb = NormalModes::with_blocks(&atoms, &singletons, &params).unwrap();
+    let all_atom = NormalModes::new(&atoms, &params).unwrap();
+
+    for (a, b) in rtb.eigenvalues().iter().zip(all_atom.eigenvalues()) {
+        assert!((a - b).abs() < 1e-5 * b.max(1.0), "{a:e} vs {b:e}");
+    }
+}
+
+/// Mass-weighted matrix-free RTB matches the dense mass-weighted RTB solve.
+#[test]
+fn matrixfree_rtb_mass_weighted() {
+    let mut atoms = ubiquitin();
+    for (i, a) in atoms.iter_mut().enumerate() {
+        a.mass = 12.0 + (i % 3) as f64;
+    }
+    let blocks = blocks_of(atoms.len(), 5);
+    let k = 8;
+
+    let mut dense_params = Params::default();
+    dense_params.mass_weighted = true;
+    let dense = NormalModes::with_blocks(&atoms, &blocks, &dense_params).unwrap();
+    let dense_nonzero = lowest_nonzero(&dense, k);
+
+    let mut params = dense_params;
+    params.k_modes = Some(k);
+    let mf = NormalModes::with_blocks(&atoms, &blocks, &params).unwrap();
+
+    for (got, want) in mf.eigenvalues().iter().zip(&dense_nonzero) {
+        assert!(
+            (got - want).abs() < 1e-5 * want.max(1.0),
+            "mass-weighted matrix-free {got:e} vs dense {want:e}"
+        );
+    }
+}
+
 /// The k lowest non-zero modes from the sparse solver must equal the dense
 /// solve's lowest k non-zero eigenvalues.
 #[test]

@@ -112,9 +112,6 @@ pub enum Error {
     /// [`Params::k_modes`] was set but the crate was built without the `sparse`
     /// feature, which provides the partial eigensolver.
     SparseFeatureRequired,
-    /// [`Params::k_modes`] is not yet supported together with
-    /// [`NormalModes::with_blocks`]; pass `None` to get all RTB modes.
-    RtbPartialUnsupported,
     /// The sparse solver could not factor the Hessian or did not converge.
     SparseSolverFailed,
 }
@@ -127,7 +124,6 @@ impl std::fmt::Display for Error {
             Self::BlockCountMismatch => write!(f, "blocks must have one entry per atom"),
             Self::DegenerateBlock => write!(f, "a multi-atom block is collinear or coincident"),
             Self::SparseFeatureRequired => write!(f, "k_modes requires the `sparse` feature"),
-            Self::RtbPartialUnsupported => write!(f, "k_modes is not supported with with_blocks"),
             Self::SparseSolverFailed => write!(f, "the sparse solver failed"),
         }
     }
@@ -248,16 +244,21 @@ impl NormalModes {
     ///
     /// This is the model used by Pepsi-SAXS / NOLB. With every atom in its own
     /// block it reduces exactly to [`new`](Self::new).
+    ///
+    /// With [`Params::k_modes`] set, only the lowest `k` non-zero modes are
+    /// computed, via a matrix-free partial solver that never forms the reduced
+    /// matrix (requires the `sparse` feature).
     pub fn with_blocks(atoms: &[Atom], blocks: &[usize], params: &Params) -> Result<Self, Error> {
-        if params.k_modes.is_some() {
-            return Err(Error::RtbPartialUnsupported);
-        }
         if blocks.len() != atoms.len() {
             return Err(Error::BlockCountMismatch);
         }
         let (positions, weights) = validated_inputs(atoms, params)?;
-        let h = build_hessian(&positions, &weights, params);
 
+        if let Some(k) = params.k_modes {
+            return Self::solve_rtb_partial(&positions, &weights, blocks, params, k);
+        }
+
+        let h = build_hessian(&positions, &weights, params);
         // Reduce to the block subspace, solve there, then lift modes back with P.
         // `tr_mul` forms Pᵀ·(H·P) without materializing the transpose of P.
         let p = rtb::projection(&positions, &weights, blocks)?;
@@ -269,6 +270,32 @@ impl NormalModes {
             &all_atom,
             atoms.len(),
         ))
+    }
+
+    /// The `k` lowest non-zero RTB modes via the matrix-free partial solver.
+    #[cfg(feature = "sparse")]
+    fn solve_rtb_partial(
+        positions: &[[f64; 3]],
+        weights: &[f64],
+        blocks: &[usize],
+        params: &Params,
+        k: usize,
+    ) -> Result<Self, Error> {
+        let contacts = network::contacts(positions, params.cutoff);
+        let (eigenvalues, vectors) =
+            sparse::lowest_rtb_modes(positions, weights, blocks, params.gamma, &contacts, k)?;
+        Ok(Self::from_modes(eigenvalues, &vectors, positions.len()))
+    }
+
+    #[cfg(not(feature = "sparse"))]
+    const fn solve_rtb_partial(
+        _: &[[f64; 3]],
+        _: &[f64],
+        _: &[usize],
+        _: &Params,
+        _: usize,
+    ) -> Result<Self, Error> {
+        Err(Error::SparseFeatureRequired)
     }
 
     /// Repackage an eigendecomposition (columns = modes, rows = `3·n_atoms`
@@ -593,25 +620,21 @@ mod tests {
         assert!(matches!(r, Err(Error::DegenerateBlock)));
     }
 
-    /// `k_modes` (a partial-spectrum request) has no meaning for the RTB path.
-    #[test]
-    fn rtb_rejects_k_modes() {
-        let atoms = cluster6();
-        let mut params = rtb_params();
-        params.k_modes = Some(3);
-        let r = NormalModes::with_blocks(&atoms, &[0, 0, 0, 1, 1, 1], &params);
-        assert!(matches!(r, Err(Error::RtbPartialUnsupported)));
-    }
-
     /// Without the `sparse` feature, requesting `k_modes` is an explicit error
-    /// rather than a silent dense solve.
+    /// rather than a silent dense solve — on both constructors.
     #[cfg(not(feature = "sparse"))]
     #[test]
     fn k_modes_requires_sparse_feature() {
         let atoms = cluster6();
         let mut params = rtb_params();
         params.k_modes = Some(2);
-        let r = NormalModes::new(&atoms, &params);
-        assert!(matches!(r, Err(Error::SparseFeatureRequired)));
+        assert!(matches!(
+            NormalModes::new(&atoms, &params),
+            Err(Error::SparseFeatureRequired)
+        ));
+        assert!(matches!(
+            NormalModes::with_blocks(&atoms, &[0, 0, 0, 1, 1, 1], &params),
+            Err(Error::SparseFeatureRequired)
+        ));
     }
 }

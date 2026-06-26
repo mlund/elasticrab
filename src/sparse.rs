@@ -40,38 +40,20 @@ pub(crate) fn lowest_nonzero_modes(
     let dof = 3 * n_atoms;
     let scale = crate::hessian::dof_scale(weights);
 
-    // Lower triangle of the mass-weighted Hessian, accumulated by (row, col).
-    let mut entries: HashMap<(usize, usize), f64> = HashMap::new();
-    for c in contacts {
-        let s = -gamma / c.dist2;
-        for a in 0..3 {
-            for b in 0..3 {
-                let block = s * c.delta[a] * c.delta[b];
-                // Off-diagonal block (j, i) is entirely below the diagonal (j > i).
-                *entries.entry((3 * c.j + a, 3 * c.i + b)).or_default() +=
-                    block * scale[3 * c.j + a] * scale[3 * c.i + b];
-                // Diagonal blocks accumulate the negated super-element; keep the
-                // lower triangle (a ≥ b).
-                if a >= b {
-                    *entries.entry((3 * c.i + a, 3 * c.i + b)).or_default() -=
-                        block * scale[3 * c.i + a] * scale[3 * c.i + b];
-                    *entries.entry((3 * c.j + a, 3 * c.j + b)).or_default() -=
-                        block * scale[3 * c.j + a] * scale[3 * c.j + b];
-                }
-            }
-        }
-    }
-
+    let entries = hessian_entries(gamma, &scale, contacts);
     let max_diag = (0..dof)
         .map(|d| entries.get(&(d, d)).copied().unwrap_or(0.0))
         .fold(0.0_f64, f64::max);
     let shift = SHIFT_FRACTION * max_diag.max(f64::MIN_POSITIVE);
 
+    // Cholesky reads the lower triangle, so emit only `row ≥ col`, with the shift
+    // added on the diagonal to keep `K + εI` positive-definite.
     let mut triplets: Vec<Triplet<usize, usize, f64>> = entries
         .iter()
+        .filter(|(&(r, c), _)| r >= c)
         .map(|(&(r, c), &v)| Triplet::new(r, c, if r == c { v + shift } else { v }))
         .collect();
-    // Diagonal entries with no contacts still need the shift to stay positive.
+    // Disconnected DOFs have no diagonal entry; the shift alone keeps them positive.
     for d in 0..dof {
         if !entries.contains_key(&(d, d)) {
             triplets.push(Triplet::new(d, d, shift));
@@ -108,6 +90,112 @@ pub(crate) fn lowest_nonzero_modes(
 
     let eigenvalues: Vec<f64> = modes.iter().map(|&(l, _)| l).collect();
     let vectors = DMatrix::from_fn(dof, modes.len(), |r, c| ritz[(r, modes[c].1)]);
+    Ok((eigenvalues, vectors))
+}
+
+/// The full symmetric mass-weighted Hessian as `(row, col) -> value`. The
+/// shift-invert path keeps only the lower triangle; the matrix-free path needs
+/// the whole matrix for its mat-vecs.
+fn hessian_entries(
+    gamma: f64,
+    scale: &[f64],
+    contacts: &[Contact],
+) -> HashMap<(usize, usize), f64> {
+    let mut acc: HashMap<(usize, usize), f64> = HashMap::new();
+    for c in contacts {
+        let s = -gamma / c.dist2;
+        for a in 0..3 {
+            for b in 0..3 {
+                let raw = s * c.delta[a] * c.delta[b];
+                // Off-diagonal block and its symmetric counterpart.
+                let (ia, jb) = (3 * c.i + a, 3 * c.j + b);
+                let off = raw * scale[ia] * scale[jb];
+                *acc.entry((ia, jb)).or_default() += off;
+                *acc.entry((jb, ia)).or_default() += off;
+                // Diagonal blocks accumulate the negated super-element.
+                let (ii_a, ii_b) = (3 * c.i + a, 3 * c.i + b);
+                let (jj_a, jj_b) = (3 * c.j + a, 3 * c.j + b);
+                *acc.entry((ii_a, ii_b)).or_default() -= raw * scale[ii_a] * scale[ii_b];
+                *acc.entry((jj_a, jj_b)).or_default() -= raw * scale[jj_a] * scale[jj_b];
+            }
+        }
+    }
+    acc
+}
+
+/// Gershgorin upper bound on the largest eigenvalue: the largest absolute row sum.
+fn gershgorin_bound(acc: &HashMap<(usize, usize), f64>, dof: usize) -> f64 {
+    let mut row_abs = vec![0.0_f64; dof];
+    for (&(r, _), &v) in acc {
+        row_abs[r] += v.abs();
+    }
+    row_abs.iter().copied().fold(0.0_f64, f64::max)
+}
+
+/// Matrix-free RTB partial solver: the `k` lowest non-zero modes of the reduced
+/// operator `R = Pᵀ K P`, applied without ever forming `R`. Regular-mode Lanczos
+/// on `c·I − R` (whose largest eigenvalues are `R`'s smallest, recovered as
+/// `λ = c − μ`), with `c` a Gershgorin bound that holds for `R` because `PᵀP = I`.
+pub(crate) fn lowest_rtb_modes(
+    positions: &[[f64; 3]],
+    weights: &[f64],
+    blocks: &[usize],
+    gamma: f64,
+    contacts: &[Contact],
+    k: usize,
+) -> Result<(Vec<f64>, DMatrix<f64>), Error> {
+    let dof = 3 * positions.len();
+    let scale = crate::hessian::dof_scale(weights);
+    let acc = hessian_entries(gamma, &scale, contacts);
+    let bound = gershgorin_bound(&acc, dof);
+
+    let fail = |_| Error::SparseSolverFailed;
+    let k_triplets: Vec<Triplet<usize, usize, f64>> = acc
+        .iter()
+        .map(|(&(r, c), &v)| Triplet::new(r, c, v))
+        .collect();
+    let k_mat = SparseColMat::try_new_from_triplets(dof, dof, &k_triplets).map_err(fail)?;
+
+    // P (3N × nb6) and its transpose, both sparse, from the block projection.
+    let (entries, nb6) = crate::rtb::projection_entries(positions, weights, blocks)?;
+    let (p_triplets, pt_triplets): (Vec<_>, Vec<_>) = entries
+        .iter()
+        .map(|&(r, c, v)| (Triplet::new(r, c, v), Triplet::new(c, r, v)))
+        .unzip();
+    let p = SparseColMat::try_new_from_triplets(dof, nb6, &p_triplets).map_err(fail)?;
+    let pt = SparseColMat::try_new_from_triplets(nb6, dof, &pt_triplets).map_err(fail)?;
+
+    // op(y) = c·y − Pᵀ(K(P y)), all sparse mat-vecs — R is never formed.
+    let op = |y: &DVector<f64>| -> DVector<f64> {
+        let py = &p * &Col::from_fn(nb6, |i| y[i]);
+        let r_y = &pt * &(&k_mat * &py);
+        DVector::from_fn(nb6, |i, _| bound * y[i] - r_y[i])
+    };
+
+    // Regular-mode Lanczos converges more slowly to clustered soft modes than
+    // the shift-invert path, so use a more generous Krylov dimension.
+    let steps = (4 * (k + 6) + 40).min(nb6);
+    let (mu, ritz) = lanczos(nb6, steps, op);
+
+    let zero_tol = ZERO_FRACTION * bound.max(f64::MIN_POSITIVE);
+    let mut modes: Vec<(f64, usize)> = mu
+        .iter()
+        .enumerate()
+        .map(|(c, &m)| (bound - m, c))
+        .filter(|&(lambda, _)| lambda > zero_tol)
+        .collect();
+    modes.sort_by(|x, y| x.0.total_cmp(&y.0));
+    modes.truncate(k);
+
+    let eigenvalues: Vec<f64> = modes.iter().map(|&(l, _)| l).collect();
+    // Lift each selected reduced eigenvector to all-atom space with P.
+    let mut vectors = DMatrix::zeros(dof, modes.len());
+    for (out, &(_, ritz_col)) in modes.iter().enumerate() {
+        let lifted = &p * &Col::from_fn(nb6, |i| ritz[(i, ritz_col)]);
+        for r in 0..dof {
+            vectors[(r, out)] = lifted[r];
+        }
+    }
     Ok((eigenvalues, vectors))
 }
 
