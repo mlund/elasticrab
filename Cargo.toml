@@ -1,0 +1,15 @@
+[package]
+name = "elasticrab"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Anisotropic Network Model (ANM) normal-mode analysis: atoms in, frequencies and modes out."
+repository = "https://github.com/mikael/elasticrab"
+keywords = ["normal-modes", "anm", "elastic-network", "biophysics", "nma"]
+categories = ["science"]
+
+[dependencies]
+nalgebra = "0.33"
+
+[dev-dependencies]
+approx = "0.5"
