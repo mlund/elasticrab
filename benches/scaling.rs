@@ -43,8 +43,12 @@ fn partial() -> Params {
     p
 }
 
+// Each solve already takes milliseconds to seconds, so a handful of samples is
+// plenty — divan's default (~100) would make the dense benchmarks run for
+// minutes. `sample_size = 1` runs the function once per sample.
+
 /// (1) Dense all-atom — medium only; the large one would not fit in memory.
-#[divan::bench]
+#[divan::bench(sample_count = 3, sample_size = 1)]
 fn dense_all_atom(bencher: Bencher) {
     bencher
         .with_inputs(|| load(MEDIUM))
@@ -52,7 +56,7 @@ fn dense_all_atom(bencher: Bencher) {
 }
 
 /// (2) Dense RTB — medium only.
-#[divan::bench]
+#[divan::bench(sample_count = 3, sample_size = 1)]
 fn dense_rtb(bencher: Bencher) {
     bencher
         .with_inputs(|| load(MEDIUM))
@@ -62,7 +66,7 @@ fn dense_rtb(bencher: Bencher) {
 }
 
 /// (3) Sparse partial all-atom — both sizes.
-#[divan::bench(args = [MEDIUM, LARGE])]
+#[divan::bench(args = [MEDIUM, LARGE], sample_count = 5, sample_size = 1)]
 fn sparse_partial(bencher: Bencher, file: &str) {
     bencher
         .with_inputs(|| load(file))
@@ -70,7 +74,7 @@ fn sparse_partial(bencher: Bencher, file: &str) {
 }
 
 /// (4) Matrix-free RTB partial — both sizes.
-#[divan::bench(args = [MEDIUM, LARGE])]
+#[divan::bench(args = [MEDIUM, LARGE], sample_count = 5, sample_size = 1)]
 fn matrixfree_rtb(bencher: Bencher, file: &str) {
     bencher
         .with_inputs(|| load(file))

@@ -55,7 +55,7 @@ implement RTB in elasticrab.
   reduced Hessian `Pᵀ H P` matches ProDy's reference `rtb2gb1_hessian.coo`. We
   compare spectra, not matrices: a block's rotational basis is fixed only up to
   orientation, so `Pᵀ H P` is basis-dependent while its eigenvalues are not.
-- **`tests/nolb_rtb.rs` (mass-weighted, authentic engine).** Our spectrum
+- **`tests/nolb_rtb.rs` (mass-weighted, the engine Pepsi wraps).** Our spectrum
   matches NOLB's frequencies for heavy-atom crambin.
 
 ### Reconciling with NOLB

@@ -1,4 +1,4 @@
-//! Mass-weighted RTB golden test against the authentic NOLB engine.
+//! Mass-weighted RTB golden test against NOLB, the engine Pepsi-SAXS wraps.
 //!
 //! NOLB (Grudinin's NOn-Linear rigid Block NMA, the engine Pepsi-SAXS wraps) is
 //! the reference for the mass-weighted RTB path. Its frequency is

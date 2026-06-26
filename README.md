@@ -24,67 +24,72 @@ let amplitudes  = modes.thermal_amplitudes(300.0);
 
 ## What it does
 
-Every pair of atoms within `cutoff` is joined by a harmonic spring; the `3N×3N`
-Hessian of that network is diagonalized into normal modes — the collective,
-low-energy motions a structure most readily makes. This is the standard ANM
-(uniform spring constant), the same super-element Hessian used by ProDy and
-Pepsi-SAXS.
+A harmonic spring joins every pair of atoms within `cutoff`; diagonalizing the
+resulting `3N×3N` Hessian gives the normal modes — the collective, low-energy
+motions a structure most readily makes. This is the standard ANM (uniform spring
+constant), the same model that ProDy and Pepsi-SAXS use.
 
 - **Public surface is four items**: `Atom`, `Params`, `NormalModes`, `Error`.
   Neighbour search, Hessian assembly, optional mass-weighting, and the
   eigensolver are all internal.
 - **Defaults match the conventional ANM** (15 Å cutoff, γ = 1, unit mass) and
-  are validated against ProDy's reference 1UBI Hessian and eigenvalues.
+  reproduce ProDy's reference 1UBI Hessian and eigenvalues.
 - **Mass-weighting is opt-in** (`Params::mass_weighted`); eigenvalues are then
   squared frequencies `ω²`.
-- **Rigid blocks are opt-in** (`NormalModes::with_blocks`): the Rotation-Translation
-  Blocks reduction used by Pepsi-SAXS/NOLB, validated against ProDy's reference.
-- **Partial solving is opt-in** (`sparse` feature + `Params::k_modes`): compute
-  only the lowest *k* non-zero modes, for large systems (e.g. a solvated protein)
-  too big to diagonalize. On `new` it uses shift-invert Lanczos on the sparse
-  Hessian; on `with_blocks` it uses **matrix-free RTB** — Lanczos on `Pᵀ K P`
-  applied with sparse mat-vecs, never forming the reduced matrix (NOLB's scheme).
+- **Rigid blocks are opt-in** (`NormalModes::with_blocks`): treat groups of atoms
+  as rigid bodies to shrink the eigenproblem (the Rotation-Translation Blocks
+  method of Pepsi-SAXS/NOLB), matching ProDy's reference.
+- **Partial solving is opt-in** (`sparse` feature + `Params::k_modes`): for large
+  systems (e.g. a solvated protein) too big to diagonalize, compute only the
+  lowest *k* non-zero modes instead of the full spectrum — for both the plain and
+  the rigid-block model.
 
 ## Scope
 
 Deliberately stops at "frequencies and modes". Structure parsing, hydration
 shells, residue coarse-graining, and fitting amplitudes to data belong to the
-caller. The default eigensolver is **dense** (cost ∝ atom-count³) — ideal for
-small and medium systems; the optional `sparse` feature adds a partial solver
-(`cargo build --features sparse`) for the lowest *k* modes of large systems.
+caller. The default eigensolver is **dense** (cost ∝ atom-count³), ideal for
+small and medium systems. For large systems, the optional `sparse` feature adds
+a partial solver for the lowest *k* modes.
 
 ## Testing
 
-`cargo test` runs:
+Every result is validated against independent references; `cargo test` runs:
 
-- **Unit & property tests** — Hessian symmetry, rigid-body null space, RTB DOF
-  accounting, error paths.
-- **Analytic mass-weighting checks** — the diatomic reduced-mass relation
-  `ω² = γ(1/m₁ + 1/m₂)` and the equal-mass scaling invariant.
-- **ProDy golden tests** — exact spectrum match for the plain ANM (1UBI) and the
-  RTB reduction (2GB1).
-- **NOLB golden test** — mass-weighted RTB against the authentic engine, via
-  vendored crambin fixtures (the binary is not needed at test time).
+- **Property tests** — Hessian symmetry, the rigid-body null space, rigid-block
+  degree-of-freedom accounting, and the error paths.
+- **Analytic checks** — closed-form results such as the diatomic reduced-mass
+  relation `ω² = γ(1/m₁ + 1/m₂)` and the equal-mass scaling law.
+- **ProDy golden tests** — the spectrum matches ProDy's published reference
+  exactly, for both the plain ANM (1UBI) and the rigid-block reduction (2GB1).
+- **NOLB golden test** — mass-weighted rigid blocks match NOLB, the engine
+  Pepsi-SAXS wraps (crambin). The reference values are vendored, so the test
+  reproduces without the binary.
 
 See [`docs/PEPSI_COMPARISON.md`](docs/PEPSI_COMPARISON.md) for how the crate
 relates to Pepsi-SAXS / NOLB.
 
 ## Benchmarks
 
-`cargo bench --features sparse` compares the four solver paths on real Cα
-structures (lowest 10 modes). Indicative numbers (one machine; relative speedups
-are the point):
+`cargo bench --features sparse` compares the dense and sparse solvers, with and
+without rigid blocks, on real protein structures (lowest 10 modes). Indicative
+numbers (one machine; the relative speedups are the point):
 
-| structure | dense all-atom | dense RTB | sparse partial | matrix-free RTB |
+| structure | dense | dense + blocks | sparse | sparse + blocks |
 |---|---|---|---|---|
-| **1A8I** (812 Cα) | 6.0 s | 1.5 s | 44 ms | 45 ms |
-| **1AON** (8015 Cα) | — (too large) | — | 1.2 s | 0.67 s |
+| medium (812 atoms) | 6.0 s | 1.5 s | 60 ms | 53 ms |
+| large (8015 atoms) | — (too large) | — | 1.5 s | 0.82 s |
 
-On the medium structure the partial solvers are **~135× faster** than dense
-all-atom and **~34× faster** than dense RTB; on the large one, where dense
-diagonalization is infeasible, matrix-free RTB finishes in well under a second.
+On the medium structure the sparse solver runs **~100× faster** than dense, and
+**~25× faster** than dense with rigid blocks. On the large one — too big for a
+dense solve to fit in memory — the sparse solver finishes in about a second.
 
 ## License
 
 Apache-2.0. Bundled test fixtures are from ProDy (MIT); see
 `tests/data/ATTRIBUTION.md`.
+
+---
+
+Contributors: the architecture and its rationale are in
+[`docs/DESIGN.md`](docs/DESIGN.md).
