@@ -21,6 +21,16 @@ let amplitudes  = modes.thermal_amplitudes(300.0);
 # Ok::<(), elasticrab::Error>(())
 ```
 
+## Features
+
+- **ANM normal modes** — dense all-atom solve; optional mass-weighting; defaults match ProDy.
+- **Rigid blocks (RTB)** — the Rotation-Translation Blocks reduction of Pepsi-SAXS / NOLB.
+- **Partial solver** (`sparse`) — the lowest *k* modes for large systems, plus a SIMD dense eigensolver; `parallel` adds multi-threading.
+- **Cell-list neighbour search** — linear in atom count; disconnected atoms are dropped, as Pepsi-SAXS / NOLB do.
+- **Mode visualization** — linear and NOLB nonlinear (bond-preserving) displacement; the `animate_pdb` example writes a multi-model PDB.
+- **Tests** (`cargo test`) — property, analytic, and golden tests: exact ProDy spectra (1UBI, 2GB1) and ~6-digit NOLB agreement (crambin), including the disconnected-atom drop.
+- **Fixtures** — vendored reference data (ProDy Hessians and eigenvalues, NOLB frequencies), so tests need no external binary.
+
 ## What it does
 
 A harmonic spring joins every pair of atoms within `cutoff`; diagonalizing the
