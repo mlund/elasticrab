@@ -26,10 +26,10 @@
 //! deliberately stops at "frequencies and modes": structure parsing, hydration,
 //! coarse-graining, and any fitting of amplitudes to data belong to the caller.
 //!
-//! The eigensolver is **dense** (cost grows with the cube of the atom count),
-//! which is ideal for small and medium systems and what the test suite
-//! validates. Larger systems will want a sparse partial solver; that is an
-//! internal change that would not affect this public API.
+//! The default solver is **dense** (cost grows with the cube of the atom count),
+//! ideal for small and medium systems. For large systems, the optional `sparse`
+//! feature adds a partial solver: set [`Params::k_modes`] to compute only the
+//! lowest *k* non-zero modes from the sparse Hessian, never forming a dense one.
 
 #![deny(missing_docs)]
 // Deliberate choices that conflict with two `clippy::nursery` lints:
@@ -41,6 +41,8 @@ mod eigen;
 mod hessian;
 mod network;
 mod rtb;
+#[cfg(feature = "sparse")]
+mod sparse;
 
 use nalgebra::DMatrix;
 
@@ -73,6 +75,11 @@ pub struct Params {
     /// When true, diagonalize the mass-weighted Hessian `M^{-1/2} H M^{-1/2}`
     /// instead of `H`; eigenvalues are then squared frequencies `ω²`.
     pub mass_weighted: bool,
+    /// Number of lowest *non-zero* modes to compute. `None` (the default) returns
+    /// all modes, including the ~6 rigid-body ones, via a dense solve. `Some(k)`
+    /// returns exactly the `k` lowest non-zero modes from a sparse partial solver
+    /// — rigid-body modes excluded — and requires the `sparse` crate feature.
+    pub k_modes: Option<usize>,
 }
 
 impl Default for Params {
@@ -81,6 +88,7 @@ impl Default for Params {
             cutoff: 15.0,
             gamma: 1.0,
             mass_weighted: false,
+            k_modes: None,
         }
     }
 }
@@ -101,6 +109,14 @@ pub enum Error {
     /// it has no well-defined rotational basis. Use a single-atom block, or
     /// blocks of three or more non-collinear atoms.
     DegenerateBlock,
+    /// [`Params::k_modes`] was set but the crate was built without the `sparse`
+    /// feature, which provides the partial eigensolver.
+    SparseFeatureRequired,
+    /// [`Params::k_modes`] is not yet supported together with
+    /// [`NormalModes::with_blocks`]; pass `None` to get all RTB modes.
+    RtbPartialUnsupported,
+    /// The sparse solver could not factor the Hessian or did not converge.
+    SparseSolverFailed,
 }
 
 impl std::fmt::Display for Error {
@@ -110,6 +126,9 @@ impl std::fmt::Display for Error {
             Self::NotFinite => write!(f, "non-finite coordinate or mass"),
             Self::BlockCountMismatch => write!(f, "blocks must have one entry per atom"),
             Self::DegenerateBlock => write!(f, "a multi-atom block is collinear or coincident"),
+            Self::SparseFeatureRequired => write!(f, "k_modes requires the `sparse` feature"),
+            Self::RtbPartialUnsupported => write!(f, "k_modes is not supported with with_blocks"),
+            Self::SparseSolverFailed => write!(f, "the sparse solver failed"),
         }
     }
 }
@@ -183,14 +202,39 @@ impl NormalModes {
     /// `SymmetricEigen::new`, and `Regex::new`).
     pub fn new(atoms: &[Atom], params: &Params) -> Result<Self, Error> {
         let (positions, weights) = validated_inputs(atoms, params)?;
-        let h = build_hessian(&positions, &weights, params);
 
+        if let Some(k) = params.k_modes {
+            return Self::solve_partial(&positions, &weights, params, k);
+        }
+
+        let h = build_hessian(&positions, &weights, params);
         let spectrum = eigen::solve(h);
         Ok(Self::from_modes(
             spectrum.eigenvalues,
             &spectrum.eigenvectors,
             atoms.len(),
         ))
+    }
+
+    /// The `k` lowest non-zero modes via the sparse partial solver.
+    #[cfg(feature = "sparse")]
+    fn solve_partial(
+        positions: &[[f64; 3]],
+        weights: &[f64],
+        params: &Params,
+        k: usize,
+    ) -> Result<Self, Error> {
+        let contacts = network::contacts(positions, params.cutoff);
+        let (eigenvalues, vectors) =
+            sparse::lowest_nonzero_modes(positions.len(), params.gamma, weights, &contacts, k)?;
+        Ok(Self::from_modes(eigenvalues, &vectors, positions.len()))
+    }
+
+    /// Without the `sparse` feature there is no partial solver, so `k_modes` is
+    /// an explicit error rather than a silent dense solve.
+    #[cfg(not(feature = "sparse"))]
+    const fn solve_partial(_: &[[f64; 3]], _: &[f64], _: &Params, _: usize) -> Result<Self, Error> {
+        Err(Error::SparseFeatureRequired)
     }
 
     /// Group atoms into rigid blocks (the Rotation-Translation Blocks method)
@@ -205,6 +249,9 @@ impl NormalModes {
     /// This is the model used by Pepsi-SAXS / NOLB. With every atom in its own
     /// block it reduces exactly to [`new`](Self::new).
     pub fn with_blocks(atoms: &[Atom], blocks: &[usize], params: &Params) -> Result<Self, Error> {
+        if params.k_modes.is_some() {
+            return Err(Error::RtbPartialUnsupported);
+        }
         if blocks.len() != atoms.len() {
             return Err(Error::BlockCountMismatch);
         }
@@ -370,6 +417,7 @@ mod tests {
             cutoff: 5.0,
             gamma: 1.0,
             mass_weighted: true,
+            k_modes: None,
         };
         let modes = NormalModes::new(&atoms, &params).unwrap();
 
@@ -413,6 +461,7 @@ mod tests {
             cutoff: 5.0,
             gamma: 1.0,
             mass_weighted: false,
+            k_modes: None,
         };
         let weighted = Params {
             mass_weighted: true,
@@ -542,5 +591,27 @@ mod tests {
         let atoms = cluster6();
         let r = NormalModes::with_blocks(&atoms, &[0, 0, 1, 1, 1, 2], &rtb_params());
         assert!(matches!(r, Err(Error::DegenerateBlock)));
+    }
+
+    /// `k_modes` (a partial-spectrum request) has no meaning for the RTB path.
+    #[test]
+    fn rtb_rejects_k_modes() {
+        let atoms = cluster6();
+        let mut params = rtb_params();
+        params.k_modes = Some(3);
+        let r = NormalModes::with_blocks(&atoms, &[0, 0, 0, 1, 1, 1], &params);
+        assert!(matches!(r, Err(Error::RtbPartialUnsupported)));
+    }
+
+    /// Without the `sparse` feature, requesting `k_modes` is an explicit error
+    /// rather than a silent dense solve.
+    #[cfg(not(feature = "sparse"))]
+    #[test]
+    fn k_modes_requires_sparse_feature() {
+        let atoms = cluster6();
+        let mut params = rtb_params();
+        params.k_modes = Some(2);
+        let r = NormalModes::new(&atoms, &params);
+        assert!(matches!(r, Err(Error::SparseFeatureRequired)));
     }
 }

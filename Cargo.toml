@@ -8,10 +8,13 @@ repository = "https://github.com/mikael/elasticrab"
 keywords = ["normal-modes", "anm", "elastic-network", "biophysics", "nma"]
 categories = ["science"]
 
+[features]
+# Opt-in partial eigensolver for the lowest non-zero modes.
+sparse = ["dep:faer"]
+
 [dependencies]
-# We use DMatrix/DVector/SymmetricEigen but none of nalgebra's `matrix!` macros,
-# so drop the default `macros` feature (and its proc-macro deps); keep `std`.
 nalgebra = { version = "0.35", default-features = false, features = ["std"] }
+faer = { version = "0.24", optional = true, default-features = false, features = ["std", "sparse-linalg"] }
 
 [dev-dependencies]
 approx = "0.5"

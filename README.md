@@ -39,14 +39,17 @@ Pepsi-SAXS.
   squared frequencies `ω²`.
 - **Rigid blocks are opt-in** (`NormalModes::with_blocks`): the Rotation-Translation
   Blocks reduction used by Pepsi-SAXS/NOLB, validated against ProDy's reference.
+- **Partial solving is opt-in** (`sparse` feature + `Params::k_modes`): compute
+  only the lowest *k* non-zero modes from the sparse Hessian via shift-invert
+  Lanczos, for large systems (e.g. a solvated protein) too big to diagonalize.
 
 ## Scope
 
 Deliberately stops at "frequencies and modes". Structure parsing, hydration
 shells, residue coarse-graining, and fitting amplitudes to data belong to the
-caller. The eigensolver is **dense** (cost ∝ atom-count³) — ideal for small and
-medium systems; a sparse partial solver could replace it later without changing
-the public API.
+caller. The default eigensolver is **dense** (cost ∝ atom-count³) — ideal for
+small and medium systems; the optional `sparse` feature adds a partial solver
+(`cargo build --features sparse`) for the lowest *k* modes of large systems.
 
 ## Testing
 

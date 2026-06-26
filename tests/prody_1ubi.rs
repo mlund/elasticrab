@@ -14,24 +14,8 @@
 
 use elasticrab::{Atom, NormalModes, Params};
 
-const DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data");
-
-/// Read Cα coordinates from a PDB file using the fixed-column ATOM format
-/// (x/y/z live in columns 31–54). Parsing belongs to the test, not the library.
-fn read_ca_pdb(path: &str) -> Vec<Atom> {
-    std::fs::read_to_string(path)
-        .unwrap()
-        .lines()
-        .filter(|l| l.starts_with("ATOM"))
-        .map(|l| {
-            let f = |a: usize, b: usize| l[a..b].trim().parse::<f64>().unwrap();
-            Atom {
-                position: [f(30, 38), f(38, 46), f(46, 54)],
-                mass: 1.0,
-            }
-        })
-        .collect()
-}
+mod common;
+use common::{read_ca_pdb, read_eigenvalues, DATA};
 
 /// Reference Hessian as a dense `dof × dof` row-major matrix, expanded from the
 /// symmetric COO triangle (1-indexed `i j value`).
@@ -48,17 +32,8 @@ fn read_coo(path: &str, dof: usize) -> Vec<f64> {
     m
 }
 
-/// Reference eigenvalues from an `index value` table.
-fn read_values(path: &str) -> Vec<f64> {
-    std::fs::read_to_string(path)
-        .unwrap()
-        .lines()
-        .map(|l| l.split_whitespace().nth(1).unwrap().parse().unwrap())
-        .collect()
-}
-
 fn compute() -> (Vec<Atom>, NormalModes) {
-    let atoms = read_ca_pdb(&format!("{DATA}/1ubi_ca.pdb"));
+    let atoms = read_ca_pdb("1ubi_ca.pdb");
     let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
     (atoms, modes)
 }
@@ -102,7 +77,7 @@ fn hessian_matches_prody() {
 #[test]
 fn eigenvalues_match_prody() {
     let (_, modes) = compute();
-    let reference = read_values(&format!("{DATA}/anm1ubi_evalues.dat"));
+    let reference = read_eigenvalues("anm1ubi_evalues.dat");
 
     assert_eq!(modes.len(), 228); // 76 Cα × 3
 

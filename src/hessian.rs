@@ -43,19 +43,20 @@ pub(crate) fn build(n_atoms: usize, gamma: f64, contacts: &[Contact]) -> DMatrix
 pub(crate) fn mass_weight(h: &mut DMatrix<f64>, masses: &[f64]) {
     // One inverse-√mass per Cartesian DOF, so the inner loop is a plain product
     // with no per-element division by 3.
-    let scale: Vec<f64> = masses
-        .iter()
-        .flat_map(|m| {
-            let s = 1.0 / m.sqrt();
-            [s, s, s]
-        })
-        .collect();
+    let scale = dof_scale(masses);
     let dof = h.nrows();
     for r in 0..dof {
         for col in 0..dof {
             h[(r, col)] *= scale[r] * scale[col];
         }
     }
+}
+
+/// Inverse-√mass weight per Cartesian DOF: one value per atom, repeated ×3.
+/// Shared by [`mass_weight`] and the sparse solver so the convention stays in
+/// one place.
+pub(crate) fn dof_scale(masses: &[f64]) -> Vec<f64> {
+    masses.iter().flat_map(|m| [1.0 / m.sqrt(); 3]).collect()
 }
 
 #[cfg(test)]
