@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/87ed30fa-b33d-4bb6-859b-17e04c9708cc" alt="Elasticrab logo" width="320">
+</p>
+
 # elasticrab 🦀
 
 A minimal, idiomatic Rust library for **Anisotropic Network Model (ANM)
