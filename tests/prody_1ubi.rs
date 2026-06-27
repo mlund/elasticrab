@@ -4,15 +4,15 @@
 //! and eigenvalues to tight tolerance is the crate's primary correctness check
 //! for the conventional (unit-mass) ANM. See `tests/data/ATTRIBUTION.md`.
 //!
-//! Parameters are ProDy's defaults — and `Params::default()` — namely a 15 Å
-//! cutoff and unit spring constant; tolerances match ProDy's own test suite
-//! (`atol = 1e-5` for the Hessian, `1e-4` for the eigenvalues).
+//! Parameters are ProDy's defaults — a 15 Å cutoff and unit spring constant;
+//! tolerances match ProDy's own test suite (`atol = 1e-5` for the Hessian,
+//! `1e-4` for the eigenvalues).
 
 // The Hessian reconstruction reads more clearly as a plain sum than as
 // `mul_add`; this is test code, not a hot path.
 #![allow(clippy::suboptimal_flops)]
 
-use elasticrab::{Atom, NormalModes, Params};
+use elasticrab::{Atom, NormalModes};
 
 mod common;
 use common::{read_ca_pdb, read_eigenvalues, DATA};
@@ -34,7 +34,7 @@ fn read_coo(path: &str, dof: usize) -> Vec<f64> {
 
 fn compute() -> (Vec<Atom>, NormalModes) {
     let atoms = read_ca_pdb("1ubi_ca.pdb");
-    let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+    let modes = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
     (atoms, modes)
 }
 

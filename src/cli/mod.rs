@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use elasticrab::{Atom, NormalModes, Params};
+use elasticrab::{Atom, NormalModes};
 use voronota_ltr::input::{
     build_residue_grouping, parse_file_with_records, AtomRecord, ParseOptions, RadiiLookup,
     Selection,
@@ -179,11 +179,12 @@ fn execute(cli: &Cli) -> Result<(), String> {
     let wanted = wanted_modes(cli)?;
     let k = *wanted.iter().max().expect("wanted is non-empty");
 
-    let mut params = Params::default();
-    params.cutoff = cli.cutoff;
-    params.mass_weighted = true;
-    params.k_modes = Some(k);
-    let modes = NormalModes::with_blocks(&atoms, &blocks, &params)
+    let modes = NormalModes::builder(&atoms)
+        .cutoff(cli.cutoff)
+        .mass_weighted()
+        .k_modes(k)
+        .blocks(&blocks)
+        .solve()
         .map_err(|e| format!("normal-mode analysis failed: {e}"))?;
     for &m in &wanted {
         if m > modes.len() {
@@ -315,10 +316,10 @@ fn effective_gamma(
 /// the correct, mass-independent configurational-fluctuation model — and the
 /// through-origin least-squares `γ = Σ B₁² / Σ B₁·B^exp` (since `B ∝ 1/γ`).
 fn fit_gamma(cli: &Cli, atoms: &[Atom], records: &[AtomRecord]) -> Result<(f64, f64), String> {
-    let mut params = Params::default();
-    params.cutoff = cli.cutoff;
-    params.mass_weighted = false;
-    let modes = NormalModes::new(atoms, &params).map_err(|e| format!("--b-factor-fit: {e}"))?;
+    let modes = NormalModes::builder(atoms)
+        .cutoff(cli.cutoff)
+        .solve()
+        .map_err(|e| format!("--b-factor-fit: {e}"))?;
 
     // Predicted B at γ=1, paired with experimental B over the connected atoms
     // (non-zero prediction) that actually carry a B-factor.

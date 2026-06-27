@@ -8,7 +8,7 @@
 //! once with the NOLB binary); this test never invokes it. See the fixture
 //! header for the exact command.
 
-use elasticrab::{Atom, NormalModes, Params};
+use elasticrab::{Atom, NormalModes};
 
 const DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data");
 
@@ -55,10 +55,12 @@ fn mass_weighted_rtb_matches_nolb() {
     let (atoms, blocks) = read_atoms_and_residue_blocks(&format!("{DATA}/crambin_heavy.pdb"));
     assert_eq!(atoms.len(), 327);
 
-    let mut params = Params::default();
-    params.cutoff = 5.0;
-    params.mass_weighted = true;
-    let modes = NormalModes::with_blocks(&atoms, &blocks, &params).unwrap();
+    let modes = NormalModes::builder(&atoms)
+        .cutoff(5.0)
+        .mass_weighted()
+        .blocks(&blocks)
+        .solve()
+        .unwrap();
 
     assert_eq!(modes.len(), 276); // 46 residues × 6 rigid DOF
 
@@ -99,10 +101,12 @@ fn disconnected_atom_dropped_matches_nolb() {
         read_atoms_and_residue_blocks(&format!("{DATA}/crambin_heavy_isolated.pdb"));
     assert_eq!(atoms.len(), 328); // 327 crambin + 1 isolated carbon
 
-    let mut params = Params::default();
-    params.cutoff = 5.0;
-    params.mass_weighted = true;
-    let modes = NormalModes::with_blocks(&atoms, &blocks, &params).unwrap();
+    let modes = NormalModes::builder(&atoms)
+        .cutoff(5.0)
+        .mass_weighted()
+        .blocks(&blocks)
+        .solve()
+        .unwrap();
 
     // The isolated atom (the last one) is dropped, exactly as NOLB drops it.
     assert_eq!(modes.disconnected(), &[327]);

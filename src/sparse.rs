@@ -103,7 +103,7 @@ fn hessian_entries(
 ) -> HashMap<(usize, usize), f64> {
     let mut acc: HashMap<(usize, usize), f64> = HashMap::new();
     for c in contacts {
-        let s = -gamma / c.dist2;
+        let s = -gamma * c.weight / c.dist2;
         for a in 0..3 {
             for b in 0..3 {
                 let raw = s * c.delta[a] * c.delta[b];

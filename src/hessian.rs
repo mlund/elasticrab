@@ -18,7 +18,7 @@ pub(crate) fn build(n_atoms: usize, gamma: f64, contacts: &[Contact]) -> DMatrix
     let mut h = DMatrix::zeros(dof, dof);
 
     for c in contacts {
-        let scale = -gamma / c.dist2;
+        let scale = -gamma * c.weight / c.dist2;
         for (a, &da) in c.delta.iter().enumerate() {
             for (b, &db) in c.delta.iter().enumerate() {
                 // The super-element d ⊗ d is symmetric, so both off-diagonal

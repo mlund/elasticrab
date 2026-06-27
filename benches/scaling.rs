@@ -7,7 +7,7 @@
 //! all-atom on the large one would need a ~24k×24k diagonalization.
 
 use divan::Bencher;
-use elasticrab::{Atom, NormalModes, Params};
+use elasticrab::{Atom, NormalModes};
 
 fn main() {
     divan::main();
@@ -37,12 +37,6 @@ fn load(name: &str) -> (Vec<Atom>, Vec<usize>) {
     (atoms, blocks)
 }
 
-fn partial() -> Params {
-    let mut p = Params::default();
-    p.k_modes = Some(K);
-    p
-}
-
 // Each solve already takes milliseconds to seconds, so a handful of samples is
 // plenty — divan's default (~100) would make the dense benchmarks run for
 // minutes. `sample_size = 1` runs the function once per sample.
@@ -52,7 +46,7 @@ fn partial() -> Params {
 fn dense_all_atom(bencher: Bencher) {
     bencher
         .with_inputs(|| load(MEDIUM))
-        .bench_values(|(atoms, _)| NormalModes::new(&atoms, &Params::default()).unwrap());
+        .bench_values(|(atoms, _)| NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap());
 }
 
 /// (2) Dense RTB — medium only.
@@ -61,7 +55,11 @@ fn dense_rtb(bencher: Bencher) {
     bencher
         .with_inputs(|| load(MEDIUM))
         .bench_values(|(atoms, blocks)| {
-            NormalModes::with_blocks(&atoms, &blocks, &Params::default()).unwrap()
+            NormalModes::builder(&atoms)
+                .cutoff(15.0)
+                .blocks(&blocks)
+                .solve()
+                .unwrap()
         });
 }
 
@@ -70,7 +68,13 @@ fn dense_rtb(bencher: Bencher) {
 fn sparse_partial(bencher: Bencher, file: &str) {
     bencher
         .with_inputs(|| load(file))
-        .bench_values(|(atoms, _)| NormalModes::new(&atoms, &partial()).unwrap());
+        .bench_values(|(atoms, _)| {
+            NormalModes::builder(&atoms)
+                .cutoff(15.0)
+                .k_modes(K)
+                .solve()
+                .unwrap()
+        });
 }
 
 /// (4) Matrix-free RTB partial — both sizes.
@@ -79,6 +83,11 @@ fn matrixfree_rtb(bencher: Bencher, file: &str) {
     bencher
         .with_inputs(|| load(file))
         .bench_values(|(atoms, blocks)| {
-            NormalModes::with_blocks(&atoms, &blocks, &partial()).unwrap()
+            NormalModes::builder(&atoms)
+                .cutoff(15.0)
+                .k_modes(K)
+                .blocks(&blocks)
+                .solve()
+                .unwrap()
         });
 }

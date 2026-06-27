@@ -5,7 +5,7 @@
 
 #![cfg(feature = "sparse")]
 
-use elasticrab::{Atom, NormalModes, Params};
+use elasticrab::{Atom, NormalModes};
 
 mod common;
 use common::{read_ca_pdb, read_eigenvalues};
@@ -15,10 +15,11 @@ fn ubiquitin() -> Vec<Atom> {
 }
 
 fn partial(atoms: &[Atom], k: usize, mass_weighted: bool) -> NormalModes {
-    let mut params = Params::default();
-    params.k_modes = Some(k);
-    params.mass_weighted = mass_weighted;
-    NormalModes::new(atoms, &params).unwrap()
+    let mut b = NormalModes::builder(atoms).cutoff(15.0).k_modes(k);
+    if mass_weighted {
+        b = b.mass_weighted();
+    }
+    b.solve().unwrap()
 }
 
 /// Group consecutive residues into rigid blocks of `size` Cα atoms each.
@@ -44,12 +45,19 @@ fn matrixfree_rtb_matches_dense_rtb() {
     let blocks = blocks_of(atoms.len(), 4); // 19 rigid blocks of 4 Cα
     let k = 10;
 
-    let dense = NormalModes::with_blocks(&atoms, &blocks, &Params::default()).unwrap();
+    let dense = NormalModes::builder(&atoms)
+        .cutoff(15.0)
+        .blocks(&blocks)
+        .solve()
+        .unwrap();
     let dense_nonzero = lowest_nonzero(&dense, k);
 
-    let mut params = Params::default();
-    params.k_modes = Some(k);
-    let mf = NormalModes::with_blocks(&atoms, &blocks, &params).unwrap();
+    let mf = NormalModes::builder(&atoms)
+        .cutoff(15.0)
+        .k_modes(k)
+        .blocks(&blocks)
+        .solve()
+        .unwrap();
 
     assert_eq!(mf.len(), k);
     for (got, want) in mf.eigenvalues().iter().zip(&dense_nonzero) {
@@ -70,10 +78,17 @@ fn matrixfree_all_singleton_matches_all_atom_partial() {
     let singletons: Vec<usize> = (0..atoms.len()).collect();
     let k = 10;
 
-    let mut params = Params::default();
-    params.k_modes = Some(k);
-    let rtb = NormalModes::with_blocks(&atoms, &singletons, &params).unwrap();
-    let all_atom = NormalModes::new(&atoms, &params).unwrap();
+    let rtb = NormalModes::builder(&atoms)
+        .cutoff(15.0)
+        .k_modes(k)
+        .blocks(&singletons)
+        .solve()
+        .unwrap();
+    let all_atom = NormalModes::builder(&atoms)
+        .cutoff(15.0)
+        .k_modes(k)
+        .solve()
+        .unwrap();
 
     for (a, b) in rtb.eigenvalues().iter().zip(all_atom.eigenvalues()) {
         assert!((a - b).abs() < 1e-5 * b.max(1.0), "{a:e} vs {b:e}");
@@ -90,14 +105,21 @@ fn matrixfree_rtb_mass_weighted() {
     let blocks = blocks_of(atoms.len(), 5);
     let k = 8;
 
-    let mut dense_params = Params::default();
-    dense_params.mass_weighted = true;
-    let dense = NormalModes::with_blocks(&atoms, &blocks, &dense_params).unwrap();
+    let dense = NormalModes::builder(&atoms)
+        .cutoff(15.0)
+        .mass_weighted()
+        .blocks(&blocks)
+        .solve()
+        .unwrap();
     let dense_nonzero = lowest_nonzero(&dense, k);
 
-    let mut params = dense_params;
-    params.k_modes = Some(k);
-    let mf = NormalModes::with_blocks(&atoms, &blocks, &params).unwrap();
+    let mf = NormalModes::builder(&atoms)
+        .cutoff(15.0)
+        .mass_weighted()
+        .k_modes(k)
+        .blocks(&blocks)
+        .solve()
+        .unwrap();
 
     for (got, want) in mf.eigenvalues().iter().zip(&dense_nonzero) {
         assert!(
@@ -114,7 +136,7 @@ fn sparse_matches_dense() {
     let atoms = ubiquitin();
     let k = 12;
 
-    let dense = NormalModes::new(&atoms, &Params::default()).unwrap();
+    let dense = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
     let dense_nonzero: Vec<f64> = dense
         .eigenvalues()
         .iter()
@@ -160,9 +182,11 @@ fn sparse_mass_weighted_matches_dense() {
     }
     let k = 8;
 
-    let mut dense_params = Params::default();
-    dense_params.mass_weighted = true;
-    let dense = NormalModes::new(&atoms, &dense_params).unwrap();
+    let dense = NormalModes::builder(&atoms)
+        .cutoff(15.0)
+        .mass_weighted()
+        .solve()
+        .unwrap();
     let dense_nonzero: Vec<f64> = dense
         .eigenvalues()
         .iter()

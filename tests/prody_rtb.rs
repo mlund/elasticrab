@@ -9,7 +9,7 @@
 
 use nalgebra::{DMatrix, SymmetricEigen};
 
-use elasticrab::{Atom, NormalModes, Params};
+use elasticrab::{Atom, NormalModes};
 
 const DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data");
 
@@ -51,7 +51,11 @@ fn coo_spectrum(path: &str, dof: usize) -> Vec<f64> {
 #[test]
 fn rtb_spectrum_matches_prody() {
     let (atoms, blocks) = read_blocked_pdb(&format!("{DATA}/2gb1_truncated.pdb"));
-    let modes = NormalModes::with_blocks(&atoms, &blocks, &Params::default()).unwrap();
+    let modes = NormalModes::builder(&atoms)
+        .cutoff(15.0)
+        .blocks(&blocks)
+        .solve()
+        .unwrap();
 
     // 28 atoms in 5 blocks: one singleton (3 DOF) + four multi-atom blocks (6 each).
     assert_eq!(modes.len(), 27);

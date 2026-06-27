@@ -7,12 +7,14 @@ use std::collections::HashMap;
 
 /// A spring between two atoms, carrying the data the Hessian assembly needs so
 /// it never has to revisit the coordinates: the endpoint indices, the
-/// displacement `j - i`, and its squared length.
+/// displacement `j - i`, its squared length, and a relative stiffness `weight`
+/// (the effective force constant is `gamma · weight`; the cutoff path uses 1.0).
 pub(crate) struct Contact {
     pub i: usize,
     pub j: usize,
     pub delta: [f64; 3],
     pub dist2: f64,
+    pub weight: f64,
 }
 
 /// All atom pairs within `cutoff` of each other.
@@ -68,7 +70,40 @@ fn displacement(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 fn contact_within(positions: &[[f64; 3]], i: usize, j: usize, cutoff2: f64) -> Option<Contact> {
     let delta = displacement(positions[i], positions[j]);
     let dist2 = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
-    (dist2 <= cutoff2).then_some(Contact { i, j, delta, dist2 })
+    (dist2 <= cutoff2).then_some(Contact {
+        i,
+        j,
+        delta,
+        dist2,
+        weight: 1.0,
+    })
+}
+
+/// Contacts from an explicit edge list: one spring per [`Spring`](crate::Spring),
+/// its geometry taken from the positions and its stiffness from the edge's
+/// `weight`. Rejects out-of-range or self-referential edges.
+pub(crate) fn contacts_from_edges(
+    positions: &[[f64; 3]],
+    springs: &[crate::Spring],
+) -> Result<Vec<Contact>, crate::Error> {
+    let n = positions.len();
+    springs
+        .iter()
+        .map(|s| {
+            if s.i >= n || s.j >= n || s.i == s.j {
+                return Err(crate::Error::InvalidSpring);
+            }
+            let delta = displacement(positions[s.i], positions[s.j]);
+            let dist2 = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
+            Ok(Contact {
+                i: s.i,
+                j: s.j,
+                delta,
+                dist2,
+                weight: s.weight,
+            })
+        })
+        .collect()
 }
 
 /// A uniform grid of cutoff-sized cells holding atom indices, stored sparsely so

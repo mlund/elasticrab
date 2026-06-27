@@ -6,14 +6,14 @@
 //! modes — the collective, low-energy motions a structure most readily makes.
 //!
 //! ```
-//! use elasticrab::{Atom, Params, NormalModes};
+//! use elasticrab::{Atom, NormalModes};
 //!
 //! let atoms = vec![
 //!     Atom { position: [0.0, 0.0, 0.0], mass: 12.0 },
 //!     Atom { position: [3.8, 0.0, 0.0], mass: 12.0 },
 //!     Atom { position: [3.8, 3.8, 0.0], mass: 12.0 },
 //! ];
-//! let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+//! let modes = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
 //!
 //! // Eigenvalues are ascending; the lowest few are the ~zero rigid-body modes.
 //! assert_eq!(modes.len(), 9); // 3 atoms × 3 Cartesian axes
@@ -27,7 +27,7 @@
 //! coarse-graining, and any fitting of amplitudes to data belong to the caller.
 //!
 //! The default solver is **dense** (cost grows with the cube of the atom count),
-//! ideal for small and medium systems. [`Params::k_modes`] returns only the
+//! ideal for small and medium systems. [`Builder::k_modes`] returns only the
 //! lowest *k* non-zero modes; the optional `sparse` feature then computes them
 //! without forming the dense Hessian, which is what scales to large systems.
 
@@ -51,9 +51,9 @@ use rtb::BlockGeometry;
 
 /// A point mass in the elastic network.
 ///
-/// `mass` is in arbitrary units and is **ignored** unless
-/// [`Params::mass_weighted`] is set; the default analysis treats every atom
-/// equally, matching the conventional ANM.
+/// `mass` is in arbitrary units and is **ignored** unless mass-weighting is
+/// enabled (see [`Builder::mass_weighted`]); the default analysis treats every
+/// atom equally, matching the conventional ANM.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Atom {
     /// Cartesian coordinates, in ångström.
@@ -62,36 +62,26 @@ pub struct Atom {
     pub mass: f64,
 }
 
-/// Parameters of the elastic-network model.
-///
-/// [`Default`] reproduces the conventional ANM settings (15 Å cutoff, unit
-/// spring constant, no mass-weighting), which is also the configuration the
-/// crate validates against ProDy.
+/// Internal solve configuration assembled by [`Builder`] (the connectivity lives
+/// separately, in the `Springs` value the builder constructs).
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[non_exhaustive]
-pub struct Params {
-    /// Maximum distance (ångström) for two atoms to be joined by a spring.
-    pub cutoff: f64,
-    /// Uniform spring constant. It scales every eigenvalue by the same factor, so
-    /// its value only sets the overall scale; the mode shapes and the ratios
-    /// between eigenvalues do not depend on it.
+pub(crate) struct Params {
+    /// Uniform spring constant `γ₀`; the effective force constant of edge `ij` is
+    /// `gamma · weight`. It scales every eigenvalue, so it sets only the overall
+    /// scale, not the mode shapes or eigenvalue ratios.
     pub gamma: f64,
     /// When true, diagonalize the mass-weighted Hessian `M^{-1/2} H M^{-1/2}`
     /// instead of `H`; eigenvalues are then squared frequencies `ω²`.
     pub mass_weighted: bool,
-    /// Number of lowest *non-zero* modes to compute. `None` (the default) returns
-    /// all modes, including the ~6 rigid-body ones. `Some(k)` returns exactly the
-    /// `k` lowest non-zero modes (rigid-body modes excluded). The `sparse` feature
-    /// computes them without ever forming the dense Hessian, which is what makes
-    /// large systems feasible; without it the result is the same but comes from a
-    /// full dense solve, so it is practical only up to medium systems.
+    /// Number of lowest *non-zero* modes to compute; `None` returns all (including
+    /// the ~6 rigid-body modes). `Some(k)` returns exactly the `k` lowest non-zero
+    /// modes; the `sparse` feature computes those without forming the dense Hessian.
     pub k_modes: Option<usize>,
 }
 
 impl Default for Params {
     fn default() -> Self {
         Self {
-            cutoff: 15.0,
             gamma: 1.0,
             mass_weighted: false,
             k_modes: None,
@@ -108,8 +98,7 @@ pub enum Error {
     /// A coordinate was not finite, or mass-weighting was requested with a
     /// non-positive or non-finite mass (which has no real square root).
     NotFinite,
-    /// The block list passed to [`NormalModes::with_blocks`] did not have one
-    /// entry per atom.
+    /// The block list given to [`Builder::blocks`] did not have one entry per atom.
     BlockCountMismatch,
     /// A multi-atom block is rank-deficient (collinear or coincident atoms), so
     /// it has no well-defined rotational basis. Use a single-atom block, or
@@ -118,9 +107,14 @@ pub enum Error {
     /// The sparse solver could not factor the Hessian or did not converge.
     SparseSolverFailed,
     /// [`NormalModes::displace_nonlinear`] was called on a result that has no
-    /// rigid blocks — it needs the per-block velocities only
-    /// [`NormalModes::with_blocks`] retains. Build the modes with `with_blocks`.
+    /// rigid blocks — it needs the per-block velocities only [`Builder::blocks`]
+    /// retains. Build the modes with [`Builder::blocks`].
     NotRigidBlocks,
+    /// [`Builder::solve`] was called without connectivity — set a
+    /// [`cutoff`](Builder::cutoff) or explicit [`springs`](Builder::springs).
+    NoNetwork,
+    /// An explicit [`Spring`] referenced an atom out of range, or itself.
+    InvalidSpring,
 }
 
 impl std::fmt::Display for Error {
@@ -131,20 +125,39 @@ impl std::fmt::Display for Error {
             Self::BlockCountMismatch => write!(f, "blocks must have one entry per atom"),
             Self::DegenerateBlock => write!(f, "a multi-atom block is collinear or coincident"),
             Self::SparseSolverFailed => write!(f, "the sparse solver failed"),
-            Self::NotRigidBlocks => write!(f, "nonlinear modes require with_blocks"),
+            Self::NotRigidBlocks => write!(f, "nonlinear modes require rigid blocks"),
+            Self::NoNetwork => write!(f, "no network: set a cutoff or springs"),
+            Self::InvalidSpring => write!(f, "a spring references an invalid atom"),
         }
     }
 }
 
 impl std::error::Error for Error {}
 
-/// One harmonic spring of the network: a pair of atoms (by *original* index) and
-/// their equilibrium separation, the rest length a displacement is measured from.
+/// One spring of an explicit elastic network: two atoms (by index into the
+/// `atoms` slice) and a relative stiffness `weight`. Pass these to
+/// [`Builder::springs`] — e.g. Voronoi contacts weighted by area. The effective
+/// force constant is `gamma · weight`, and the rest length is the atoms'
+/// equilibrium separation, so only the connectivity and weight are given here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spring {
+    /// Index of the first atom, into the `atoms` slice.
+    pub i: usize,
+    /// Index of the second atom, into the `atoms` slice.
+    pub j: usize,
+    /// Relative stiffness; the force constant is `gamma · weight`.
+    pub weight: f64,
+}
+
+/// One spring of the *built* network, kept so [`energy`](NormalModes::energy) can
+/// score any conformation: the atom pair (by *original* index), the equilibrium
+/// rest length, and the relative stiffness weight.
 #[derive(Debug)]
-struct Spring {
+struct Bond {
     i: usize,
     j: usize,
     rest: f64,
+    weight: f64,
 }
 
 /// The normal modes of an elastic network: eigenvalues paired with mode shapes,
@@ -162,13 +175,13 @@ pub struct NormalModes {
     n_atoms: usize,
     /// Original indices of atoms dropped for being disconnected (degree 0).
     disconnected: Vec<usize>,
-    /// Rigid-block decomposition, kept only for [`with_blocks`](NormalModes::with_blocks)
-    /// results; it carries the per-block velocities the nonlinear extrapolation needs.
+    /// Rigid-block decomposition, kept only for rigid-block (RTB) results; it
+    /// carries the per-block velocities the nonlinear extrapolation needs.
     rtb: Option<Rtb>,
-    /// Equilibrium springs and their uniform constant, kept so
+    /// Equilibrium springs and the global constant, kept so
     /// [`energy`](NormalModes::energy) can score any conformation without
     /// rebuilding the network.
-    springs: Vec<Spring>,
+    springs: Vec<Bond>,
     gamma: f64,
 }
 
@@ -198,10 +211,13 @@ const BOLTZMANN_KJ_PER_MOL_K: f64 = 8.314_462_618e-3;
 /// near-zero vector.
 const ROTATION_EPS: f64 = 1e-12;
 
-/// Shared validation: returns per-atom positions and the per-atom weights used
-/// by the Hessian and any block projection (atomic masses when mass-weighting,
-/// otherwise unit).
-fn validated_inputs(atoms: &[Atom], params: &Params) -> Result<(Vec<[f64; 3]>, Vec<f64>), Error> {
+/// Shared validation: per-atom positions and raw masses. Coordinates must be
+/// finite; masses are checked finite-and-positive only when `mass_weighted`,
+/// since that is the only path that takes their square root.
+fn validated_inputs(
+    atoms: &[Atom],
+    mass_weighted: bool,
+) -> Result<(Vec<[f64; 3]>, Vec<f64>), Error> {
     if atoms.len() < 2 {
         return Err(Error::TooFewAtoms);
     }
@@ -209,15 +225,21 @@ fn validated_inputs(atoms: &[Atom], params: &Params) -> Result<(Vec<[f64; 3]>, V
     if positions.iter().flatten().any(|x| !x.is_finite()) {
         return Err(Error::NotFinite);
     }
-    if params.mass_weighted && atoms.iter().any(|a| !(a.mass.is_finite() && a.mass > 0.0)) {
+    if mass_weighted && atoms.iter().any(|a| !(a.mass.is_finite() && a.mass > 0.0)) {
         return Err(Error::NotFinite);
     }
-    let weights = if params.mass_weighted {
-        atoms.iter().map(|a| a.mass).collect()
+    let masses = atoms.iter().map(|a| a.mass).collect();
+    Ok((positions, masses))
+}
+
+/// The per-DOF mass-weighting weights for a solve: the kept atoms' masses when
+/// mass-weighting (already validated positive), otherwise unit.
+fn solve_weights(net: &Network, params: &Params) -> Vec<f64> {
+    if params.mass_weighted {
+        net.masses.clone()
     } else {
-        vec![1.0; atoms.len()]
-    };
-    Ok((positions, weights))
+        vec![1.0; net.keep.len()]
+    }
 }
 
 /// Assemble the all-atom ANM Hessian from precomputed contacts, mass-weighted
@@ -255,25 +277,33 @@ fn pick_columns(m: &DMatrix<f64>, columns: &[usize]) -> DMatrix<f64> {
     DMatrix::from_fn(m.nrows(), columns.len(), |r, idx| m[(r, columns[idx])])
 }
 
-/// The connected elastic network, ready to solve: positions, weights, and
-/// contacts renumbered to the atoms a spring actually touches. `keep[p]` is the
-/// original index of kept atom `p`; `disconnected` lists the degree-0 atoms that
-/// were removed (empty for a fully connected structure).
+/// The connected elastic network, ready to solve: positions, raw masses, and
+/// weighted contacts renumbered to the atoms a spring actually touches. `keep[p]`
+/// is the original index of kept atom `p`; `disconnected` lists the degree-0 atoms
+/// that were removed (empty for a fully connected structure).
 struct Network {
     positions: Vec<[f64; 3]>,
-    weights: Vec<f64>,
+    masses: Vec<f64>,
     contacts: Vec<Contact>,
     keep: Vec<usize>,
     disconnected: Vec<usize>,
 }
 
-/// Validate the atoms, build the cell-list contacts, and drop disconnected atoms
-/// — the shared front half of both constructors. Fails if fewer than two atoms
-/// remain connected.
-fn prepare(atoms: &[Atom], params: &Params) -> Result<Network, Error> {
-    let (positions, weights) = validated_inputs(atoms, params)?;
-    let contacts = network::contacts(&positions, params.cutoff);
-    let net = drop_disconnected(positions, weights, contacts);
+/// Validate the atoms, build the contacts (cutoff or explicit springs), and drop
+/// disconnected atoms. Fails if fewer than two atoms remain connected.
+fn build_network(
+    atoms: &[Atom],
+    cutoff: Option<f64>,
+    springs: Option<&[Spring]>,
+    mass_weighted: bool,
+) -> Result<Network, Error> {
+    let (positions, masses) = validated_inputs(atoms, mass_weighted)?;
+    let contacts = match (cutoff, springs) {
+        (Some(c), None) => network::contacts(&positions, c),
+        (None, Some(s)) => network::contacts_from_edges(&positions, s)?,
+        _ => return Err(Error::NoNetwork),
+    };
+    let net = drop_disconnected(positions, masses, contacts);
     if net.keep.len() < 2 {
         return Err(Error::TooFewAtoms);
     }
@@ -285,7 +315,7 @@ fn prepare(atoms: &[Atom], params: &Params) -> Result<Network, Error> {
 /// nothing.
 fn drop_disconnected(
     positions: Vec<[f64; 3]>,
-    weights: Vec<f64>,
+    masses: Vec<f64>,
     contacts: Vec<Contact>,
 ) -> Network {
     let n = positions.len();
@@ -293,7 +323,7 @@ fn drop_disconnected(
     if disconnected.is_empty() {
         return Network {
             positions,
-            weights,
+            masses,
             contacts,
             keep: (0..n).collect(),
             disconnected,
@@ -321,11 +351,12 @@ fn drop_disconnected(
             j: new_index[c.j],
             delta: c.delta,
             dist2: c.dist2,
+            weight: c.weight,
         })
         .collect();
     Network {
         positions: keep.iter().map(|&old| positions[old]).collect(),
-        weights: keep.iter().map(|&old| weights[old]).collect(),
+        masses: keep.iter().map(|&old| masses[old]).collect(),
         contacts,
         keep,
         disconnected,
@@ -333,43 +364,48 @@ fn drop_disconnected(
 }
 
 impl NormalModes {
-    /// Build the ANM Hessian for `atoms` and diagonalize it.
+    /// Start configuring a normal-mode analysis over `atoms`. Set the network
+    /// ([`cutoff`](Builder::cutoff) or [`springs`](Builder::springs)) and any
+    /// options, then call [`solve`](Builder::solve).
     ///
-    /// Heavy and fallible by design — it assembles a `3N×3N` matrix and runs a
-    /// symmetric eigendecomposition.
-    pub fn new(atoms: &[Atom], params: &Params) -> Result<Self, Error> {
-        let net = prepare(atoms, params)?;
+    /// ```
+    /// # use elasticrab::{Atom, NormalModes};
+    /// # let atoms = [Atom{position:[0.0;3],mass:12.0}, Atom{position:[3.8,0.0,0.0],mass:12.0}];
+    /// let modes = NormalModes::builder(&atoms).cutoff(15.0).solve()?;
+    /// # Ok::<(), elasticrab::Error>(())
+    /// ```
+    pub fn builder(atoms: &[Atom]) -> Builder<'_> {
+        Builder::new(atoms)
+    }
 
+    /// Assemble the all-atom Hessian and diagonalize it. Heavy and fallible by
+    /// design — it forms a `3N×3N` matrix and runs a symmetric eigendecomposition.
+    fn solve_all_atom(net: &Network, params: &Params, n_original: usize) -> Result<Self, Error> {
         // The `sparse` feature computes only the lowest `k` modes directly; without
         // it `k_modes` still works, via a full dense solve truncated to those modes.
         #[cfg(feature = "sparse")]
         if let Some(k) = params.k_modes {
-            return Self::solve_partial(&net, params, k, atoms.len());
+            return Self::solve_partial(net, params, k, n_original);
         }
 
-        let h = build_hessian(net.keep.len(), &net.weights, &net.contacts, params);
+        let weights = solve_weights(net, params);
+        let h = build_hessian(net.keep.len(), &weights, &net.contacts, params);
         let spectrum = eigen::solve(h);
-        match params.k_modes {
-            None => Ok(Self::from_modes(
+        Ok(match params.k_modes {
+            None => Self::from_modes(
                 spectrum.eigenvalues,
                 &spectrum.eigenvectors,
-                &net,
-                atoms.len(),
+                net,
+                n_original,
                 params.gamma,
-            )),
+            ),
             Some(k) => {
                 let columns = lowest_nonzero_columns(&spectrum.eigenvalues, k);
                 let eigenvalues = columns.iter().map(|&c| spectrum.eigenvalues[c]).collect();
                 let vectors = pick_columns(&spectrum.eigenvectors, &columns);
-                Ok(Self::from_modes(
-                    eigenvalues,
-                    &vectors,
-                    &net,
-                    atoms.len(),
-                    params.gamma,
-                ))
+                Self::from_modes(eigenvalues, &vectors, net, n_original, params.gamma)
             }
-        }
+        })
     }
 
     /// The `k` lowest non-zero modes via the sparse partial solver.
@@ -380,13 +416,9 @@ impl NormalModes {
         k: usize,
         n_original: usize,
     ) -> Result<Self, Error> {
-        let (eigenvalues, vectors) = sparse::lowest_nonzero_modes(
-            net.keep.len(),
-            params.gamma,
-            &net.weights,
-            &net.contacts,
-            k,
-        )?;
+        let weights = solve_weights(net, params);
+        let (eigenvalues, vectors) =
+            sparse::lowest_nonzero_modes(net.keep.len(), params.gamma, &weights, &net.contacts, k)?;
         Ok(Self::from_modes(
             eigenvalues,
             &vectors,
@@ -396,39 +428,31 @@ impl NormalModes {
         ))
     }
 
-    /// Group atoms into rigid blocks (the Rotation-Translation Blocks method)
-    /// and solve the reduced eigenproblem.
-    ///
-    /// `blocks` gives one block id per atom (parallel to `atoms`); ids need not
-    /// be contiguous. Each block keeps six rigid degrees of freedom — three if
-    /// it is a single atom — so the problem shrinks to `nb6 ≤ 6·n_blocks`
-    /// coordinates. The returned modes are the same per-atom displacement fields
-    /// as [`new`](Self::new), lifted back from the reduced space.
-    ///
-    /// This is the model used by Pepsi-SAXS / NOLB. With every atom in its own
-    /// block it reduces exactly to [`new`](Self::new).
-    ///
-    /// With [`Params::k_modes`] set, only the lowest `k` non-zero modes are
-    /// returned. The `sparse` feature computes them with a matrix-free partial
-    /// solver that never forms the reduced matrix; without it they come from a
-    /// full dense reduction.
-    pub fn with_blocks(atoms: &[Atom], blocks: &[usize], params: &Params) -> Result<Self, Error> {
-        if blocks.len() != atoms.len() {
+    /// Solve the rigid-block (RTB) reduced eigenproblem. `blocks` is parallel to
+    /// the original atoms; the modes are the same per-atom fields as the all-atom
+    /// solve, lifted back from the reduced space.
+    fn solve_blocks(
+        net: &Network,
+        blocks: &[usize],
+        params: &Params,
+        n_original: usize,
+    ) -> Result<Self, Error> {
+        if blocks.len() != n_original {
             return Err(Error::BlockCountMismatch);
         }
-        let net = prepare(atoms, params)?;
         // The drop carries the blocks along: a block keeps only its connected atoms.
         let blocks: Vec<usize> = net.keep.iter().map(|&old| blocks[old]).collect();
+        let weights = solve_weights(net, params);
 
         #[cfg(feature = "sparse")]
         if let Some(k) = params.k_modes {
-            return Self::solve_rtb_partial(&net, &blocks, params, k, atoms.len());
+            return Self::solve_rtb_partial(net, &blocks, &weights, params, k, n_original);
         }
 
-        let h = build_hessian(net.keep.len(), &net.weights, &net.contacts, params);
+        let h = build_hessian(net.keep.len(), &weights, &net.contacts, params);
         // Reduce to the block subspace and solve there; `tr_mul` forms Pᵀ·(H·P)
         // without materializing the transpose of P.
-        let p = rtb::projection(&net.positions, &net.weights, &blocks)?;
+        let p = rtb::projection(&net.positions, &weights, &blocks)?;
         let reduced_hessian = p.tr_mul(&(&h * &p));
         let spectrum = eigen::solve(reduced_hessian);
         // Keep all modes, or — the dense `k_modes` fallback — the lowest k non-zero.
@@ -442,8 +466,8 @@ impl NormalModes {
         };
         // Lift the reduced modes back with P, and keep them for nonlinear modes.
         let all_atom = &p * &reduced;
-        let rtb = Self::build_rtb(&net, &blocks, reduced)?;
-        let mut modes = Self::from_modes(eigenvalues, &all_atom, &net, atoms.len(), params.gamma);
+        let rtb = Self::build_rtb(net, &blocks, &weights, reduced)?;
+        let mut modes = Self::from_modes(eigenvalues, &all_atom, net, n_original, params.gamma);
         modes.rtb = Some(rtb);
         Ok(modes)
     }
@@ -453,19 +477,20 @@ impl NormalModes {
     fn solve_rtb_partial(
         net: &Network,
         blocks: &[usize],
+        weights: &[f64],
         params: &Params,
         k: usize,
         n_original: usize,
     ) -> Result<Self, Error> {
         let (eigenvalues, vectors, reduced) = sparse::lowest_rtb_modes(
             &net.positions,
-            &net.weights,
+            weights,
             blocks,
             params.gamma,
             &net.contacts,
             k,
         )?;
-        let rtb = Self::build_rtb(net, blocks, reduced)?;
+        let rtb = Self::build_rtb(net, blocks, weights, reduced)?;
         let mut modes = Self::from_modes(eigenvalues, &vectors, net, n_original, params.gamma);
         modes.rtb = Some(rtb);
         Ok(modes)
@@ -490,15 +515,16 @@ impl NormalModes {
                 modes[base + orig] = [col[3 * p], col[3 * p + 1], col[3 * p + 2]];
             }
         }
-        // Record each spring in original atom indices with its rest length, so
-        // `energy` can score later conformations directly.
+        // Record each spring in original atom indices with its rest length and
+        // weight, so `energy` can score later conformations directly.
         let springs = net
             .contacts
             .iter()
-            .map(|c| Spring {
+            .map(|c| Bond {
                 i: net.keep[c.i],
                 j: net.keep[c.j],
                 rest: c.dist2.sqrt(),
+                weight: c.weight,
             })
             .collect();
         Self {
@@ -515,8 +541,13 @@ impl NormalModes {
     /// Build the rigid-block decomposition kept by the RTB constructors: the
     /// reduced eigenvectors plus per-block geometry, with block atoms remapped
     /// from the connected numbering back to the original atom indices.
-    fn build_rtb(net: &Network, blocks: &[usize], reduced: DMatrix<f64>) -> Result<Rtb, Error> {
-        let mut geometry = rtb::block_geometry(&net.positions, &net.weights, blocks)?;
+    fn build_rtb(
+        net: &Network,
+        blocks: &[usize],
+        weights: &[f64],
+        reduced: DMatrix<f64>,
+    ) -> Result<Rtb, Error> {
+        let mut geometry = rtb::block_geometry(&net.positions, weights, blocks)?;
         for block in &mut geometry {
             for atom in &mut block.atoms {
                 *atom = net.keep[*atom];
@@ -529,8 +560,7 @@ impl NormalModes {
     }
 
     /// Number of modes: three per connected atom for the plain model, or the
-    /// reduced rigid-block degree-of-freedom count for
-    /// [`with_blocks`](Self::with_blocks).
+    /// reduced rigid-block degree-of-freedom count for a rigid-block (RTB) solve.
     pub const fn len(&self) -> usize {
         self.eigenvalues.len()
     }
@@ -597,8 +627,8 @@ impl NormalModes {
     /// Disconnected atoms stay put.
     ///
     /// # Errors
-    /// [`Error::NotRigidBlocks`] if the modes came from [`new`](Self::new), which
-    /// keeps no blocks. Build them with [`with_blocks`](Self::with_blocks).
+    /// [`Error::NotRigidBlocks`] if the modes were not built with rigid blocks
+    /// (no per-block velocities to extrapolate). Use [`Builder::blocks`].
     ///
     /// # Panics
     /// If `i >= self.len()`, or `positions.len()` is not the original atom count.
@@ -690,7 +720,7 @@ impl NormalModes {
     ///
     /// These are *configurational* fluctuations: independent of mass, so for
     /// physical B-factors build the modes **without** mass-weighting
-    /// ([`Params::mass_weighted`] = `false`). The result is one value per original
+    /// (without [`Builder::mass_weighted`]). The result is one value per original
     /// atom; a disconnected atom (zero in every mode) scores 0. With γ in
     /// kJ/mol/Å² the values are in Å².
     pub fn fluctuations(&self, temperature_k: f64) -> Vec<f64> {
@@ -749,10 +779,99 @@ impl NormalModes {
                 let q = positions[s.j];
                 let distance =
                     ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
-                (distance - s.rest).powi(2)
+                s.weight * (distance - s.rest).powi(2)
             })
             .sum();
         0.5 * self.gamma * sum
+    }
+}
+
+/// Fluent configuration for a normal-mode solve, returned by
+/// [`NormalModes::builder`]. Set connectivity ([`cutoff`](Self::cutoff) or
+/// [`springs`](Self::springs)) and options, then [`solve`](Self::solve).
+pub struct Builder<'a> {
+    atoms: &'a [Atom],
+    cutoff: Option<f64>,
+    springs: Option<&'a [Spring]>,
+    blocks: Option<&'a [usize]>,
+    params: Params,
+}
+
+impl<'a> Builder<'a> {
+    fn new(atoms: &'a [Atom]) -> Self {
+        Self {
+            atoms,
+            cutoff: None,
+            springs: None,
+            blocks: None,
+            params: Params::default(),
+        }
+    }
+
+    /// Connect every pair of atoms within `cutoff` ångström by a uniform spring.
+    /// Mutually exclusive with [`springs`](Self::springs).
+    #[must_use]
+    pub const fn cutoff(mut self, cutoff: f64) -> Self {
+        self.cutoff = Some(cutoff);
+        self
+    }
+
+    /// Use an explicit list of weighted springs (e.g. area-weighted Voronoi
+    /// contacts) instead of a cutoff. Mutually exclusive with
+    /// [`cutoff`](Self::cutoff).
+    #[must_use]
+    pub const fn springs(mut self, springs: &'a [Spring]) -> Self {
+        self.springs = Some(springs);
+        self
+    }
+
+    /// Global spring constant `γ₀` (default `1.0`); the force constant of edge `ij`
+    /// is `γ₀ · weight`. It scales every eigenvalue, setting only the overall scale.
+    #[must_use]
+    pub const fn gamma(mut self, gamma: f64) -> Self {
+        self.params.gamma = gamma;
+        self
+    }
+
+    /// Diagonalize the mass-weighted Hessian; eigenvalues become squared
+    /// frequencies `ω²` (default: off, the plain ANM).
+    #[must_use]
+    pub const fn mass_weighted(mut self) -> Self {
+        self.params.mass_weighted = true;
+        self
+    }
+
+    /// Return only the `k` lowest non-zero modes (default: all). The `sparse`
+    /// feature computes them without forming the dense Hessian.
+    #[must_use]
+    pub const fn k_modes(mut self, k: usize) -> Self {
+        self.params.k_modes = Some(k);
+        self
+    }
+
+    /// Group atoms into rigid blocks (Rotation-Translation Blocks): one block id
+    /// per atom, parallel to `atoms`. Shrinks the eigenproblem and enables the
+    /// nonlinear extrapolation; the modes are still per-atom fields.
+    #[must_use]
+    pub const fn blocks(mut self, blocks: &'a [usize]) -> Self {
+        self.blocks = Some(blocks);
+        self
+    }
+
+    /// Build the network and solve. Errors include [`Error::NoNetwork`] (no
+    /// `cutoff`/`springs` set), [`Error::TooFewAtoms`], and [`Error::InvalidSpring`].
+    pub fn solve(self) -> Result<NormalModes, Error> {
+        let net = build_network(
+            self.atoms,
+            self.cutoff,
+            self.springs,
+            self.params.mass_weighted,
+        )?;
+        let n = self.atoms.len();
+        match self.blocks {
+            Some(blocks) => NormalModes::solve_blocks(&net, blocks, &self.params, n),
+            None => NormalModes::solve_all_atom(&net, &self.params, n),
+        }
     }
 }
 
@@ -770,14 +889,16 @@ mod tests {
 
     #[test]
     fn too_few_atoms_is_rejected() {
-        let r = NormalModes::new(&[carbon(0.0, 0.0, 0.0)], &Params::default());
+        let r = NormalModes::builder(&[carbon(0.0, 0.0, 0.0)])
+            .cutoff(15.0)
+            .solve();
         assert!(matches!(r, Err(Error::TooFewAtoms)));
     }
 
     #[test]
     fn non_finite_coordinate_is_rejected() {
         let atoms = [carbon(0.0, 0.0, 0.0), carbon(f64::NAN, 0.0, 0.0)];
-        let r = NormalModes::new(&atoms, &Params::default());
+        let r = NormalModes::builder(&atoms).cutoff(15.0).solve();
         assert!(matches!(r, Err(Error::NotFinite)));
     }
 
@@ -792,7 +913,7 @@ mod tests {
             carbon(0.0, 0.0, 1.5),
             carbon(1.0, 1.0, 1.0),
         ];
-        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let modes = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
 
         let zeros = modes
             .eigenvalues()
@@ -812,7 +933,7 @@ mod tests {
             carbon(0.0, 1.5, 0.0),
             carbon(1.0, 1.0, 1.0),
         ];
-        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let modes = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
         let amps = modes.thermal_amplitudes(300.0);
 
         assert_eq!(amps.len(), modes.len());
@@ -840,14 +961,14 @@ mod tests {
     #[test]
     fn energy_of_the_input_structure_is_zero() {
         let atoms = cluster();
-        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let modes = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
         assert_relative_eq!(modes.energy(&positions(&atoms)), 0.0);
     }
 
     #[test]
     fn energy_is_zero_under_rigid_translation() {
         let atoms = cluster();
-        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let modes = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
         let shifted: Vec<_> = positions(&atoms)
             .iter()
             .map(|p| [p[0] + 5.0, p[1] - 3.0, p[2] + 1.0])
@@ -858,7 +979,7 @@ mod tests {
     #[test]
     fn energy_is_zero_under_rigid_rotation() {
         let atoms = cluster();
-        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let modes = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
         // A 90° turn about z, (x, y, z) -> (-y, x, z), preserves every distance.
         let rotated: Vec<_> = positions(&atoms)
             .iter()
@@ -871,7 +992,7 @@ mod tests {
     #[test]
     fn diatomic_stretch_energy_is_half_gamma_delta_squared() {
         let atoms = [carbon(0.0, 0.0, 0.0), carbon(3.8, 0.0, 0.0)];
-        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let modes = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
         let delta = 0.4;
         let stretched = [[0.0, 0.0, 0.0], [3.8 + delta, 0.0, 0.0]];
         assert_relative_eq!(
@@ -886,18 +1007,15 @@ mod tests {
     fn energy_scales_linearly_with_gamma() {
         let atoms = cluster();
         let displaced = {
-            let base = NormalModes::new(&atoms, &Params::default()).unwrap();
+            let base = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
             base.displace(&positions(&atoms), 6, 0.7)
         };
-        let unit = NormalModes::new(&atoms, &Params::default()).unwrap();
-        let stiff = NormalModes::new(
-            &atoms,
-            &Params {
-                gamma: 3.0,
-                ..Params::default()
-            },
-        )
-        .unwrap();
+        let unit = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
+        let stiff = NormalModes::builder(&atoms)
+            .cutoff(15.0)
+            .gamma(3.0)
+            .solve()
+            .unwrap();
         assert_relative_eq!(
             stiff.energy(&displaced),
             3.0 * unit.energy(&displaced),
@@ -914,7 +1032,7 @@ mod tests {
             carbon(0.0, 1.5, 0.0),
             carbon(100.0, 100.0, 100.0), // far beyond the cutoff: dropped
         ];
-        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let modes = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
         assert_eq!(modes.disconnected(), &[3]);
         let mut moved = positions(&atoms);
         moved[3] = [200.0, -50.0, 7.0];
@@ -924,7 +1042,7 @@ mod tests {
     #[test]
     fn a_displaced_mode_has_positive_energy() {
         let atoms = cluster();
-        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let modes = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
         let displaced = modes.displace(&positions(&atoms), 6, 0.5);
         assert!(modes.energy(&displaced) > ZERO_EIGENVALUE);
     }
@@ -933,7 +1051,7 @@ mod tests {
     #[should_panic(expected = "one entry per atom")]
     fn energy_rejects_wrong_length_positions() {
         let atoms = cluster();
-        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let modes = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
         let _ = modes.energy(&[[0.0, 0.0, 0.0]]);
     }
 
@@ -941,15 +1059,12 @@ mod tests {
     #[test]
     fn fluctuations_scale_inversely_with_gamma() {
         let atoms = cluster();
-        let unit = NormalModes::new(&atoms, &Params::default()).unwrap();
-        let stiff = NormalModes::new(
-            &atoms,
-            &Params {
-                gamma: 2.0,
-                ..Params::default()
-            },
-        )
-        .unwrap();
+        let unit = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
+        let stiff = NormalModes::builder(&atoms)
+            .cutoff(15.0)
+            .gamma(2.0)
+            .solve()
+            .unwrap();
         for (u, s) in unit
             .fluctuations(300.0)
             .iter()
@@ -967,7 +1082,7 @@ mod tests {
             carbon(0.0, 1.5, 0.0),
             carbon(100.0, 100.0, 100.0), // dropped
         ];
-        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let modes = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
         let msf = modes.fluctuations(300.0);
         assert_eq!(msf.len(), atoms.len());
         assert_relative_eq!(msf[3], 0.0);
@@ -977,7 +1092,7 @@ mod tests {
     #[test]
     fn predicted_b_factors_are_fluctuations_times_the_prefactor() {
         let atoms = cluster();
-        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let modes = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
         let prefactor = 8.0 * std::f64::consts::PI * std::f64::consts::PI / 3.0;
         for (msf, b) in modes
             .fluctuations(300.0)
@@ -1003,13 +1118,11 @@ mod tests {
                 mass: 16.0,
             },
         ];
-        let params = Params {
-            cutoff: 5.0,
-            gamma: 1.0,
-            mass_weighted: true,
-            k_modes: None,
-        };
-        let modes = NormalModes::new(&atoms, &params).unwrap();
+        let modes = NormalModes::builder(&atoms)
+            .cutoff(5.0)
+            .mass_weighted()
+            .solve()
+            .unwrap();
 
         let nonzero = modes
             .eigenvalues()
@@ -1047,19 +1160,12 @@ mod tests {
                 mass: m,
             },
         ];
-        let base = Params {
-            cutoff: 5.0,
-            gamma: 1.0,
-            mass_weighted: false,
-            k_modes: None,
-        };
-        let weighted = Params {
-            mass_weighted: true,
-            ..base
-        };
-
-        let unit = NormalModes::new(&atoms, &base).unwrap();
-        let scaled = NormalModes::new(&atoms, &weighted).unwrap();
+        let unit = NormalModes::builder(&atoms).cutoff(5.0).solve().unwrap();
+        let scaled = NormalModes::builder(&atoms)
+            .cutoff(5.0)
+            .mass_weighted()
+            .solve()
+            .unwrap();
         for k in 0..unit.len() {
             assert_relative_eq!(
                 scaled.eigenvalues()[k],
@@ -1087,11 +1193,12 @@ mod tests {
         .collect()
     }
 
-    fn rtb_params() -> Params {
-        Params {
-            cutoff: 5.0,
-            ..Params::default()
-        }
+    /// A 5 Å rigid-block (RTB) solve — the helper the RTB tests build on.
+    fn rtb(atoms: &[Atom], blocks: &[usize]) -> Result<NormalModes, Error> {
+        NormalModes::builder(atoms)
+            .cutoff(5.0)
+            .blocks(blocks)
+            .solve()
     }
 
     /// Each atom in its own block ⇒ the projection is the identity, so RTB must
@@ -1101,8 +1208,8 @@ mod tests {
         let atoms = cluster6();
         let blocks: Vec<usize> = (0..atoms.len()).collect();
 
-        let plain = NormalModes::new(&atoms, &rtb_params()).unwrap();
-        let rtb = NormalModes::with_blocks(&atoms, &blocks, &rtb_params()).unwrap();
+        let plain = NormalModes::builder(&atoms).cutoff(5.0).solve().unwrap();
+        let rtb = rtb(&atoms, &blocks).unwrap();
 
         assert_eq!(rtb.len(), plain.len());
         for (a, b) in rtb.eigenvalues().iter().zip(plain.eigenvalues()) {
@@ -1115,8 +1222,8 @@ mod tests {
     #[test]
     fn block_id_values_are_remapped() {
         let atoms = cluster6();
-        let a = NormalModes::with_blocks(&atoms, &[0, 0, 0, 1, 1, 1], &rtb_params()).unwrap();
-        let b = NormalModes::with_blocks(&atoms, &[42, 42, 42, 7, 7, 7], &rtb_params()).unwrap();
+        let a = rtb(&atoms, &[0, 0, 0, 1, 1, 1]).unwrap();
+        let b = rtb(&atoms, &[42, 42, 42, 7, 7, 7]).unwrap();
         for (x, y) in a.eigenvalues().iter().zip(b.eigenvalues()) {
             assert_relative_eq!(x, y, epsilon = 1e-12);
         }
@@ -1127,7 +1234,7 @@ mod tests {
     #[test]
     fn interleaved_blocks_are_grouped_by_id() {
         let atoms = cluster6();
-        let modes = NormalModes::with_blocks(&atoms, &[0, 1, 0, 1, 0, 1], &rtb_params()).unwrap();
+        let modes = rtb(&atoms, &[0, 1, 0, 1, 0, 1]).unwrap();
         assert_eq!(modes.len(), 12); // two non-singleton blocks, 6 DOF each
         let zeros = modes
             .eigenvalues()
@@ -1141,7 +1248,7 @@ mod tests {
     #[test]
     fn whole_structure_is_one_rigid_block() {
         let atoms = cluster6();
-        let modes = NormalModes::with_blocks(&atoms, &[0; 6], &rtb_params()).unwrap();
+        let modes = rtb(&atoms, &[0; 6]).unwrap();
         assert_eq!(modes.len(), 6);
         for &v in modes.eigenvalues() {
             assert!(v.abs() < 1e-6);
@@ -1152,7 +1259,7 @@ mod tests {
     #[test]
     fn dof_accounting_mixes_block_sizes() {
         let atoms = &cluster6()[..4];
-        let modes = NormalModes::with_blocks(atoms, &[0, 0, 0, 1], &rtb_params()).unwrap();
+        let modes = rtb(atoms, &[0, 0, 0, 1]).unwrap();
         assert_eq!(modes.len(), 9);
     }
 
@@ -1161,7 +1268,7 @@ mod tests {
     #[test]
     fn lifted_modes_are_unit_norm() {
         let atoms = cluster6();
-        let modes = NormalModes::with_blocks(&atoms, &[0, 0, 0, 1, 1, 1], &rtb_params()).unwrap();
+        let modes = rtb(&atoms, &[0, 0, 0, 1, 1, 1]).unwrap();
         for i in 0..modes.len() {
             let norm2: f64 = modes.eigenvector(i).iter().flatten().map(|x| x * x).sum();
             assert_relative_eq!(norm2, 1.0, epsilon = 1e-9);
@@ -1171,7 +1278,7 @@ mod tests {
     #[test]
     fn block_count_must_match_atoms() {
         let atoms = cluster6();
-        let r = NormalModes::with_blocks(&atoms, &[0, 0], &rtb_params());
+        let r = rtb(&atoms, &[0, 0]);
         assert!(matches!(r, Err(Error::BlockCountMismatch)));
     }
 
@@ -1179,7 +1286,7 @@ mod tests {
     fn collinear_block_is_degenerate() {
         // Block 0 holds two atoms — always collinear, so no rotational basis.
         let atoms = cluster6();
-        let r = NormalModes::with_blocks(&atoms, &[0, 0, 1, 1, 1, 2], &rtb_params());
+        let r = rtb(&atoms, &[0, 0, 1, 1, 1, 2]);
         assert!(matches!(r, Err(Error::DegenerateBlock)));
     }
 
@@ -1191,7 +1298,7 @@ mod tests {
     fn isolated_atom_is_dropped() {
         let mut atoms = cluster6();
         atoms.push(carbon(100.0, 100.0, 100.0)); // no neighbour within cutoff
-        let modes = NormalModes::new(&atoms, &rtb_params()).unwrap();
+        let modes = NormalModes::builder(&atoms).cutoff(5.0).solve().unwrap();
 
         assert_eq!(modes.disconnected(), &[6]);
         assert_eq!(modes.len(), 18); // 6 connected atoms × 3, not 21
@@ -1206,7 +1313,10 @@ mod tests {
         assert_eq!(zeros, 6); // not 9 — the isolated atom's spurious modes are gone
 
         // The kept spectrum equals solving the six connected atoms alone.
-        let reference = NormalModes::new(&cluster6(), &rtb_params()).unwrap();
+        let reference = NormalModes::builder(&cluster6())
+            .cutoff(5.0)
+            .solve()
+            .unwrap();
         for (a, b) in modes.eigenvalues().iter().zip(reference.eigenvalues()) {
             assert_relative_eq!(a, b, epsilon = 1e-9);
         }
@@ -1219,16 +1329,14 @@ mod tests {
         let mut atoms = cluster6();
         atoms.push(carbon(100.0, 100.0, 100.0));
         // Two 3-atom blocks over the cluster; the isolated atom is its own block.
-        let modes =
-            NormalModes::with_blocks(&atoms, &[0, 0, 0, 1, 1, 1, 2], &rtb_params()).unwrap();
+        let modes = rtb(&atoms, &[0, 0, 0, 1, 1, 1, 2]).unwrap();
 
         assert_eq!(modes.disconnected(), &[6]);
         assert_eq!(modes.len(), 12); // two 6-DOF blocks; the dummy block is gone
         for i in 0..modes.len() {
             assert_eq!(modes.eigenvector(i)[6], [0.0, 0.0, 0.0]);
         }
-        let reference =
-            NormalModes::with_blocks(&cluster6(), &[0, 0, 0, 1, 1, 1], &rtb_params()).unwrap();
+        let reference = rtb(&cluster6(), &[0, 0, 0, 1, 1, 1]).unwrap();
         for (a, b) in modes.eigenvalues().iter().zip(reference.eigenvalues()) {
             assert_relative_eq!(a, b, epsilon = 1e-9);
         }
@@ -1239,7 +1347,7 @@ mod tests {
     fn all_atoms_disconnected_is_too_few() {
         let atoms = [carbon(0.0, 0.0, 0.0), carbon(100.0, 0.0, 0.0)];
         assert!(matches!(
-            NormalModes::new(&atoms, &rtb_params()),
+            NormalModes::builder(&atoms).cutoff(5.0).solve(),
             Err(Error::TooFewAtoms)
         ));
     }
@@ -1251,7 +1359,7 @@ mod tests {
     fn displace_shifts_atoms_along_the_mode() {
         let atoms = cluster6();
         let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
-        let modes = NormalModes::new(&atoms, &rtb_params()).unwrap();
+        let modes = NormalModes::builder(&atoms).cutoff(5.0).solve().unwrap();
 
         assert_eq!(modes.displace(&positions, 6, 0.0), positions);
 
@@ -1272,7 +1380,7 @@ mod tests {
         let mut atoms = cluster6();
         atoms.push(carbon(100.0, 100.0, 100.0));
         let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
-        let modes = NormalModes::new(&atoms, &rtb_params()).unwrap();
+        let modes = NormalModes::builder(&atoms).cutoff(5.0).solve().unwrap();
 
         let moved = modes.displace(&positions, 6, 5.0);
         assert_eq!(moved[6], positions[6]);
@@ -1290,7 +1398,7 @@ mod tests {
     fn nonlinear_preserves_intra_block_distances() {
         let atoms = cluster6();
         let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
-        let modes = NormalModes::with_blocks(&atoms, &[0, 0, 0, 1, 1, 1], &rtb_params()).unwrap();
+        let modes = rtb(&atoms, &[0, 0, 0, 1, 1, 1]).unwrap();
 
         let mut saw_rotation = false;
         for i in 6..modes.len() {
@@ -1325,7 +1433,7 @@ mod tests {
         let atoms = cluster6();
         let blocks: Vec<usize> = (0..atoms.len()).collect();
         let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
-        let modes = NormalModes::with_blocks(&atoms, &blocks, &rtb_params()).unwrap();
+        let modes = rtb(&atoms, &blocks).unwrap();
 
         for i in 6..modes.len() {
             let nonlinear = modes.displace_nonlinear(&positions, i, 1.5).unwrap();
@@ -1372,12 +1480,12 @@ mod tests {
             },
         ];
         let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
-        let params = Params {
-            cutoff: 5.0,
-            mass_weighted: true,
-            ..Params::default()
-        };
-        let modes = NormalModes::with_blocks(&atoms, &[0, 0, 0, 1, 1, 1], &params).unwrap();
+        let modes = NormalModes::builder(&atoms)
+            .cutoff(5.0)
+            .mass_weighted()
+            .blocks(&[0, 0, 0, 1, 1, 1])
+            .solve()
+            .unwrap();
 
         let a = 1e-6;
         for i in 6..modes.len() {
@@ -1399,7 +1507,7 @@ mod tests {
     fn nonlinear_requires_blocks() {
         let atoms = cluster6();
         let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
-        let modes = NormalModes::new(&atoms, &rtb_params()).unwrap();
+        let modes = NormalModes::builder(&atoms).cutoff(5.0).solve().unwrap();
         assert!(matches!(
             modes.displace_nonlinear(&positions, 6, 1.0),
             Err(Error::NotRigidBlocks)
@@ -1414,8 +1522,6 @@ mod tests {
     #[test]
     fn k_modes_falls_back_to_dense() {
         let atoms = cluster6();
-        let mut params = rtb_params();
-        params.k_modes = Some(2);
 
         let lowest_two = |full: &NormalModes| -> Vec<f64> {
             full.eigenvalues()
@@ -1426,19 +1532,117 @@ mod tests {
                 .collect()
         };
 
-        let plain = NormalModes::new(&atoms, &params).unwrap();
+        let plain = NormalModes::builder(&atoms)
+            .cutoff(5.0)
+            .k_modes(2)
+            .solve()
+            .unwrap();
         assert_eq!(plain.len(), 2);
-        let plain_full = NormalModes::new(&atoms, &rtb_params()).unwrap();
+        let plain_full = NormalModes::builder(&atoms).cutoff(5.0).solve().unwrap();
         for (got, want) in plain.eigenvalues().iter().zip(lowest_two(&plain_full)) {
             assert_relative_eq!(got, &want, epsilon = 1e-9);
         }
 
         let blocks = [0, 0, 0, 1, 1, 1];
-        let rtb = NormalModes::with_blocks(&atoms, &blocks, &params).unwrap();
-        assert_eq!(rtb.len(), 2);
-        let rtb_full = NormalModes::with_blocks(&atoms, &blocks, &rtb_params()).unwrap();
-        for (got, want) in rtb.eigenvalues().iter().zip(lowest_two(&rtb_full)) {
+        let rtb_k = NormalModes::builder(&atoms)
+            .cutoff(5.0)
+            .k_modes(2)
+            .blocks(&blocks)
+            .solve()
+            .unwrap();
+        assert_eq!(rtb_k.len(), 2);
+        let rtb_full = rtb(&atoms, &blocks).unwrap();
+        for (got, want) in rtb_k.eigenvalues().iter().zip(lowest_two(&rtb_full)) {
             assert_relative_eq!(got, &want, epsilon = 1e-9);
         }
+    }
+
+    // --- explicit springs ---
+
+    /// All pairs as unit-weight springs reproduce the cutoff network exactly (here
+    /// the cluster is small enough that a 15 Å cutoff also connects every pair).
+    #[test]
+    fn unit_weight_springs_match_the_cutoff_network() {
+        let atoms = cluster();
+        let springs: Vec<Spring> = (0..atoms.len())
+            .flat_map(|i| (i + 1..atoms.len()).map(move |j| Spring { i, j, weight: 1.0 }))
+            .collect();
+        let by_edges = NormalModes::builder(&atoms)
+            .springs(&springs)
+            .solve()
+            .unwrap();
+        let by_cutoff = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
+        for (a, b) in by_edges.eigenvalues().iter().zip(by_cutoff.eigenvalues()) {
+            assert_relative_eq!(a, b, epsilon = 1e-9);
+        }
+    }
+
+    /// The weight scales an edge's stiffness, so a diatomic's stretch eigenvalue
+    /// scales with it.
+    #[test]
+    fn doubling_a_spring_weight_doubles_its_eigenvalue() {
+        let atoms = [carbon(0.0, 0.0, 0.0), carbon(3.8, 0.0, 0.0)];
+        let stretch = |weight| {
+            NormalModes::builder(&atoms)
+                .springs(&[Spring { i: 0, j: 1, weight }])
+                .solve()
+                .unwrap()
+                .eigenvalues()[5]
+        };
+        assert_relative_eq!(stretch(2.0), 2.0 * stretch(1.0), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn springs_reject_out_of_range_and_self_edges() {
+        let atoms = [carbon(0.0, 0.0, 0.0), carbon(1.0, 0.0, 0.0)];
+        let bad = |spring| {
+            NormalModes::builder(&atoms)
+                .springs(&[spring])
+                .solve()
+                .unwrap_err()
+        };
+        assert_eq!(
+            bad(Spring {
+                i: 0,
+                j: 5,
+                weight: 1.0
+            }),
+            Error::InvalidSpring
+        );
+        assert_eq!(
+            bad(Spring {
+                i: 1,
+                j: 1,
+                weight: 1.0
+            }),
+            Error::InvalidSpring
+        );
+    }
+
+    #[test]
+    fn springs_drop_a_degree_zero_atom() {
+        let atoms = [
+            carbon(0.0, 0.0, 0.0),
+            carbon(1.5, 0.0, 0.0),
+            carbon(5.0, 5.0, 5.0), // touched by no spring
+        ];
+        let modes = NormalModes::builder(&atoms)
+            .springs(&[Spring {
+                i: 0,
+                j: 1,
+                weight: 1.0,
+            }])
+            .solve()
+            .unwrap();
+        assert_eq!(modes.disconnected(), &[2]);
+    }
+
+    #[test]
+    fn solve_without_connectivity_errors() {
+        let atoms = cluster();
+        assert_eq!(
+            NormalModes::builder(&atoms).solve().unwrap_err(),
+            Error::NoNetwork
+        );
     }
 }
