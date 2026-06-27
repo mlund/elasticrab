@@ -4,6 +4,9 @@
 # editor swap files
 *.swp
 
-# animation output written to the repo root by the animate_pdb example
+# CLI output written to the repo root (trajectories, energy tables)
 # (tracked fixtures live under tests/data/ and are unaffected)
 /*.pdb
+/*.xtc
+/*.csv
+

@@ -29,7 +29,9 @@ struct Cli {
     #[arg(short, long, default_value_t = 5.0, value_name = "ANGSTROM")]
     cutoff: f64,
 
-    /// Animate the lowest N modes (1 = softest); ignored when --mode is given.
+    /// Animate the N lowest modes (1 = softest).
+    ///
+    /// Ignored when --mode is given.
     #[arg(short = 'n', long, default_value_t = 1, value_name = "N")]
     modes: usize,
 
@@ -37,35 +39,49 @@ struct Cli {
     #[arg(long = "mode", value_name = "INDEX")]
     mode: Vec<usize>,
 
-    /// Frames per trajectory; 0 suppresses the trajectory (report only).
+    /// Frames per trajectory (0 = report only).
     #[arg(short = 's', long, default_value_t = 20, value_name = "N")]
     frames: usize,
 
-    /// Peak deformation amplitude, as RMSD from the input in ångström.
+    /// Peak displacement RMSD, in ångström.
     #[arg(short = 'a', long, default_value_t = 1.5, value_name = "RMSD")]
     amplitude: f64,
 
-    /// Use linear displacement (stretches bonds) instead of the bond-preserving
-    /// nonlinear rigid-block extrapolation.
+    /// Use linear displacement, not the nonlinear default.
+    ///
+    /// Straight-line motion stretches bonds; nonlinear keeps them rigid.
     #[arg(long)]
     linear: bool,
 
-    /// Include HETATM records (ligands, ions); waters (HOH) are always dropped.
+    /// Include HETATM records (ligands, ions).
+    ///
+    /// Waters (HOH) are always dropped by the parser.
     #[arg(long)]
     hetatm: bool,
 
-    /// Keep only atoms matching a VMD-like selection, e.g. "chain A and name CA".
+    /// Keep only atoms matching a VMD-like selection.
+    ///
+    /// For example, "chain A and name CA".
     #[arg(long, value_name = "EXPR")]
     select: Option<String>,
 
-    /// Trajectory output path; `.pdb` or `.xtc` by extension. Defaults to
-    /// `<input>_mode<k>.pdb`; with several modes, `_mode<k>` is inserted.
+    /// Trajectory output path; format by `.pdb`/`.xtc` extension.
+    ///
+    /// Defaults to `<input>_mode<k>.pdb`, one file per mode.
     #[arg(short, long, value_name = "PATH")]
     output: Option<PathBuf>,
 
     /// Also write the report (frequencies, counts) as JSON to this file.
     #[arg(long, value_name = "FILE")]
     json: Option<PathBuf>,
+
+    /// Merge all modes into one trajectory + a per-frame energy CSV.
+    ///
+    /// Columns: frame, mode, rmsd (Å), energy (Å², γ=1). Native frame first.
+    ///
+    /// Weight a frame by exp(−γ·energy / kT).
+    #[arg(long, value_name = "FILE")]
+    energy: Option<PathBuf>,
 }
 
 /// Entry point: set up diagnostics, parse arguments, run, and turn any error into
@@ -136,19 +152,81 @@ fn execute(cli: &Cli) -> Result<(), String> {
 
     report(cli, &records, &blocks, &modes)?;
 
-    if cli.frames > 0 {
+    if let Some(csv) = cli.energy.as_deref() {
+        write_merged(cli, &modes, &positions, &records, &wanted, csv)?;
+    } else if cli.frames > 0 {
         let multi = wanted.len() > 1;
         for &m in &wanted {
             let path = output_path(cli.output.as_deref(), &cli.input, m, multi);
-            if same_path(&path, &cli.input) {
-                return Err(format!(
-                    "refusing to overwrite the input structure {}",
-                    cli.input.display()
-                ));
-            }
+            guard_input(&path, &cli.input)?;
             let frames = animate(&modes, &positions, m, cli.amplitude, cli.frames, cli.linear)?;
             write_trajectory(&path, &records, &frames)?;
         }
+    }
+    Ok(())
+}
+
+/// `--energy`: merge the native frame plus every mode's frames into one
+/// trajectory and write the matching per-frame energy table. The energies are
+/// the elastic-network spring energy of each frame (native = 0), comparable
+/// across modes because the energy depends only on the coordinates.
+fn write_merged(
+    cli: &Cli,
+    modes: &NormalModes,
+    positions: &[[f64; 3]],
+    records: &[AtomRecord],
+    wanted: &[usize],
+    csv: &Path,
+) -> Result<(), String> {
+    if cli.frames == 0 {
+        return Err("--energy needs --frames greater than 0 (nothing to score otherwise)".into());
+    }
+    // Resolve and check every output path before animating, so a clobbering
+    // mistake fails fast and never destroys the input or one output with another.
+    let traj = cli.output.as_deref().map_or_else(
+        || with_stem(&cli.input, |stem| format!("{stem}_modes.pdb")),
+        Path::to_path_buf,
+    );
+    guard_input(&traj, &cli.input)?;
+    guard_input(csv, &cli.input)?;
+    if same_path(csv, &traj) {
+        return Err(format!(
+            "the energy table and the trajectory cannot be the same file ({})",
+            csv.display()
+        ));
+    }
+
+    // Frame 0 is the native structure — the energy zero and the MC rest state.
+    let mut frames = vec![positions.to_vec()];
+    let mut rows = vec![io::EnergyRow {
+        frame: 0,
+        mode: 0,
+        rmsd: 0.0,
+        energy: modes.energy(positions),
+    }];
+    for &m in wanted {
+        for frame in animate(modes, positions, m, cli.amplitude, cli.frames, cli.linear)? {
+            rows.push(io::EnergyRow {
+                frame: frames.len(),
+                mode: m,
+                rmsd: rms_deviation(&frame, positions),
+                energy: modes.energy(&frame),
+            });
+            frames.push(frame);
+        }
+    }
+
+    write_trajectory(&traj, records, &frames)?;
+    io::write_csv(csv, &rows)
+}
+
+/// Refuse to write a trajectory over the input structure.
+fn guard_input(output: &Path, input: &Path) -> Result<(), String> {
+    if same_path(output, input) {
+        return Err(format!(
+            "refusing to overwrite the input structure {}",
+            input.display()
+        ));
     }
     Ok(())
 }

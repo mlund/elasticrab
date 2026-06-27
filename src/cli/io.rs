@@ -13,6 +13,15 @@ use voronota_ltr::input::AtomRecord;
 /// A trajectory: one entry per frame, each a per-atom coordinate set (ångström).
 pub type Trajectory = [Vec<[f64; 3]>];
 
+/// One row of the per-frame energy table written beside a merged trajectory.
+pub struct EnergyRow {
+    pub frame: usize,
+    /// 1-based mode index; `0` marks the native (input) frame.
+    pub mode: usize,
+    pub rmsd: f64,
+    pub energy: f64,
+}
+
 /// Standard atomic weights for the common protein elements; a neutral fallback
 /// (carbon) covers anything else, since mass-weighting only rescales the spectrum.
 pub fn element_mass(element: &str) -> f64 {
@@ -28,6 +37,25 @@ pub fn element_mass(element: &str) -> f64 {
 /// Format an output error with the path that failed.
 fn writing(path: &Path, e: &std::io::Error) -> String {
     format!("writing {}: {e}", path.display())
+}
+
+/// Write the energy table as CSV (`frame,mode,rmsd,energy`), one row per frame in
+/// the merged trajectory's order, streamed row by row.
+pub fn write_csv(path: &Path, rows: &[EnergyRow]) -> Result<(), String> {
+    let file = File::create(path).map_err(|e| writing(path, &e))?;
+    let mut writer = BufWriter::new(file);
+    writer
+        .write_all(b"frame,mode,rmsd,energy\n")
+        .map_err(|e| writing(path, &e))?;
+    for r in rows {
+        writeln!(
+            writer,
+            "{},{},{:.6},{:.6}",
+            r.frame, r.mode, r.rmsd, r.energy
+        )
+        .map_err(|e| writing(path, &e))?;
+    }
+    writer.flush().map_err(|e| writing(path, &e))
 }
 
 /// Write a multi-model PDB trajectory: `MODEL`/`ENDMDL` per frame, re-using the

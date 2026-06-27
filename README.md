@@ -33,7 +33,8 @@ let amplitudes  = modes.thermal_amplitudes(300.0);
 - **Partial solver** (`Params::k_modes`) — return just the lowest *k* modes; `sparse` makes it scale to large systems (and adds a SIMD dense solver), `parallel` multi-threads.
 - **Cell-list neighbour search** — linear in atom count; disconnected atoms are dropped, as Pepsi-SAXS / NOLB do.
 - **Mode visualization** — linear and NOLB nonlinear (bond-preserving) displacement.
-- **Command-line tool** (`cli` feature) — the `elasticrab` binary animates modes into PDB/XTC trajectories, with PDB/mmCIF input, VMD-like atom selection, and a JSON report.
+- **Conformational energy** — `NormalModes::energy()` scores any structure with the network's spring energy, for Boltzmann reweighting of sampled conformations.
+- **Command-line tool** (`cli` feature) — the `elasticrab` binary animates modes into PDB/XTC trajectories, with PDB/mmCIF input, VMD-like atom selection, a JSON report, and a per-frame energy table for Monte-Carlo reweighting.
 - **Tests** (`cargo test`) — property, analytic, and golden tests: exact ProDy spectra (1UBI, 2GB1) and ~6-digit NOLB agreement (crambin), including the disconnected-atom drop.
 - **Fixtures** — vendored reference data (ProDy Hessians and eigenvalues, NOLB frequencies), so tests need no external binary.
 
@@ -104,11 +105,19 @@ Then animate the softest modes of a structure (PDB or mmCIF):
 elasticrab protein.pdb -o mode1.pdb                       # softest mode, bond-preserving
 elasticrab protein.pdb -n 5 -o anim.xtc                   # five lowest modes -> anim_mode1.xtc …
 elasticrab protein.pdb --select "chain A" --json out.json # restrict atoms; structured report
+elasticrab protein.pdb -n 5 -o pool.xtc --energy e.csv    # merge modes + per-frame energies
 ```
 
 It prints a frequency report to stdout (`--json` writes it to a file); run
 `elasticrab --help` for cutoff, amplitude, frame-count, and selection options.
 The interface is similar to NOLB.
+
+`--energy` merges every requested mode into one trajectory (the native structure
+first) and writes a `frame,mode,rmsd,energy` table — the elastic-network spring
+energy of each frame, comparable across modes. Reweight a Monte-Carlo move
+between frames with `exp(−γ·energy / k_B T)` for your chosen γ and temperature.
+`frame` is the 0-based index in trajectory order (a multi-model PDB labels the
+same frame `MODEL frame+1`).
 
 ## Benchmarks
 

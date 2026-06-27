@@ -46,3 +46,7 @@ divan = "0.1"
 name = "scaling"
 harness = false
 required-features = ["sparse"]
+
+[profile.release]
+# Strip symbols from the release binary (smaller `elasticrab` CLI).
+strip = true

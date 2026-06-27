@@ -138,6 +138,15 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// One harmonic spring of the network: a pair of atoms (by *original* index) and
+/// their equilibrium separation, the rest length a displacement is measured from.
+#[derive(Debug)]
+struct Spring {
+    i: usize,
+    j: usize,
+    rest: f64,
+}
+
 /// The normal modes of an elastic network: eigenvalues paired with mode shapes,
 /// sorted by ascending eigenvalue.
 ///
@@ -156,6 +165,11 @@ pub struct NormalModes {
     /// Rigid-block decomposition, kept only for [`with_blocks`](NormalModes::with_blocks)
     /// results; it carries the per-block velocities the nonlinear extrapolation needs.
     rtb: Option<Rtb>,
+    /// Equilibrium springs and their uniform constant, kept so
+    /// [`energy`](NormalModes::energy) can score any conformation without
+    /// rebuilding the network.
+    springs: Vec<Spring>,
+    gamma: f64,
 }
 
 /// The data the nonlinear extrapolation needs beyond the per-atom mode shapes:
@@ -341,12 +355,19 @@ impl NormalModes {
                 &spectrum.eigenvectors,
                 &net,
                 atoms.len(),
+                params.gamma,
             )),
             Some(k) => {
                 let columns = lowest_nonzero_columns(&spectrum.eigenvalues, k);
                 let eigenvalues = columns.iter().map(|&c| spectrum.eigenvalues[c]).collect();
                 let vectors = pick_columns(&spectrum.eigenvectors, &columns);
-                Ok(Self::from_modes(eigenvalues, &vectors, &net, atoms.len()))
+                Ok(Self::from_modes(
+                    eigenvalues,
+                    &vectors,
+                    &net,
+                    atoms.len(),
+                    params.gamma,
+                ))
             }
         }
     }
@@ -366,7 +387,13 @@ impl NormalModes {
             &net.contacts,
             k,
         )?;
-        Ok(Self::from_modes(eigenvalues, &vectors, net, n_original))
+        Ok(Self::from_modes(
+            eigenvalues,
+            &vectors,
+            net,
+            n_original,
+            params.gamma,
+        ))
     }
 
     /// Group atoms into rigid blocks (the Rotation-Translation Blocks method)
@@ -416,7 +443,7 @@ impl NormalModes {
         // Lift the reduced modes back with P, and keep them for nonlinear modes.
         let all_atom = &p * &reduced;
         let rtb = Self::build_rtb(&net, &blocks, reduced)?;
-        let mut modes = Self::from_modes(eigenvalues, &all_atom, &net, atoms.len());
+        let mut modes = Self::from_modes(eigenvalues, &all_atom, &net, atoms.len(), params.gamma);
         modes.rtb = Some(rtb);
         Ok(modes)
     }
@@ -439,7 +466,7 @@ impl NormalModes {
             k,
         )?;
         let rtb = Self::build_rtb(net, blocks, reduced)?;
-        let mut modes = Self::from_modes(eigenvalues, &vectors, net, n_original);
+        let mut modes = Self::from_modes(eigenvalues, &vectors, net, n_original, params.gamma);
         modes.rtb = Some(rtb);
         Ok(modes)
     }
@@ -454,6 +481,7 @@ impl NormalModes {
         vectors: &DMatrix<f64>,
         net: &Network,
         n_original: usize,
+        gamma: f64,
     ) -> Self {
         let mut modes = vec![[0.0; 3]; eigenvalues.len() * n_original];
         for (m, col) in vectors.column_iter().enumerate() {
@@ -462,12 +490,25 @@ impl NormalModes {
                 modes[base + orig] = [col[3 * p], col[3 * p + 1], col[3 * p + 2]];
             }
         }
+        // Record each spring in original atom indices with its rest length, so
+        // `energy` can score later conformations directly.
+        let springs = net
+            .contacts
+            .iter()
+            .map(|c| Spring {
+                i: net.keep[c.i],
+                j: net.keep[c.j],
+                rest: c.dist2.sqrt(),
+            })
+            .collect();
         Self {
             eigenvalues,
             modes,
             n_atoms: n_original,
             disconnected: net.disconnected.clone(),
             rtb: None,
+            springs,
+            gamma,
         }
     }
 
@@ -642,6 +683,40 @@ impl NormalModes {
             })
             .collect()
     }
+
+    /// Elastic-network energy of a conformation: `½γ Σ (|r_ij| − r⁰_ij)²` over the
+    /// springs, in the energy units of `gamma` (kJ/mol when γ is in kJ/mol/Å²).
+    ///
+    /// This is the potential whose Boltzmann factor `exp(−E / k_B T)` weights a
+    /// conformation — the quantity to reweight Monte-Carlo moves between
+    /// structures sampled from [`displace`](Self::displace) /
+    /// [`displace_nonlinear`](Self::displace_nonlinear). It depends only on the
+    /// coordinates, not on masses or on which mode produced them, so energies from
+    /// different modes are directly comparable. The input structure scores 0, as
+    /// does any rigid-body motion of the whole structure; a disconnected atom has
+    /// no spring and never contributes.
+    ///
+    /// # Panics
+    /// If `positions.len()` is not the original atom count.
+    pub fn energy(&self, positions: &[[f64; 3]]) -> f64 {
+        assert_eq!(
+            positions.len(),
+            self.n_atoms,
+            "positions must have one entry per atom"
+        );
+        let sum: f64 = self
+            .springs
+            .iter()
+            .map(|s| {
+                let p = positions[s.i];
+                let q = positions[s.j];
+                let distance =
+                    ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
+                (distance - s.rest).powi(2)
+            })
+            .sum();
+        0.5 * self.gamma * sum
+    }
 }
 
 #[cfg(test)]
@@ -710,6 +785,119 @@ mod tests {
         }
         // Softer modes (smaller eigenvalue) fluctuate more than stiffer ones.
         assert!(amps[6] >= amps[7]);
+    }
+
+    fn positions(atoms: &[Atom]) -> Vec<[f64; 3]> {
+        atoms.iter().map(|a| a.position).collect()
+    }
+
+    fn cluster() -> [Atom; 4] {
+        [
+            carbon(0.0, 0.0, 0.0),
+            carbon(1.5, 0.0, 0.0),
+            carbon(0.0, 1.5, 0.0),
+            carbon(1.0, 1.0, 1.0),
+        ]
+    }
+
+    #[test]
+    fn energy_of_the_input_structure_is_zero() {
+        let atoms = cluster();
+        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        assert_relative_eq!(modes.energy(&positions(&atoms)), 0.0);
+    }
+
+    #[test]
+    fn energy_is_zero_under_rigid_translation() {
+        let atoms = cluster();
+        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let shifted: Vec<_> = positions(&atoms)
+            .iter()
+            .map(|p| [p[0] + 5.0, p[1] - 3.0, p[2] + 1.0])
+            .collect();
+        assert_relative_eq!(modes.energy(&shifted), 0.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn energy_is_zero_under_rigid_rotation() {
+        let atoms = cluster();
+        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        // A 90° turn about z, (x, y, z) -> (-y, x, z), preserves every distance.
+        let rotated: Vec<_> = positions(&atoms)
+            .iter()
+            .map(|p| [-p[1], p[0], p[2]])
+            .collect();
+        assert_relative_eq!(modes.energy(&rotated), 0.0, epsilon = 1e-9);
+    }
+
+    /// A stretched diatomic has the closed-form energy `½γΔ²`.
+    #[test]
+    fn diatomic_stretch_energy_is_half_gamma_delta_squared() {
+        let atoms = [carbon(0.0, 0.0, 0.0), carbon(3.8, 0.0, 0.0)];
+        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let delta = 0.4;
+        let stretched = [[0.0, 0.0, 0.0], [3.8 + delta, 0.0, 0.0]];
+        assert_relative_eq!(
+            modes.energy(&stretched),
+            0.5 * delta * delta,
+            epsilon = 1e-12
+        );
+    }
+
+    /// γ only rescales the energy, so doubling it doubles every conformation's score.
+    #[test]
+    fn energy_scales_linearly_with_gamma() {
+        let atoms = cluster();
+        let displaced = {
+            let base = NormalModes::new(&atoms, &Params::default()).unwrap();
+            base.displace(&positions(&atoms), 6, 0.7)
+        };
+        let unit = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let stiff = NormalModes::new(
+            &atoms,
+            &Params {
+                gamma: 3.0,
+                ..Params::default()
+            },
+        )
+        .unwrap();
+        assert_relative_eq!(
+            stiff.energy(&displaced),
+            3.0 * unit.energy(&displaced),
+            epsilon = 1e-9
+        );
+    }
+
+    /// A disconnected atom carries no spring, so moving it cannot change the energy.
+    #[test]
+    fn moving_a_disconnected_atom_leaves_energy_unchanged() {
+        let atoms = [
+            carbon(0.0, 0.0, 0.0),
+            carbon(1.5, 0.0, 0.0),
+            carbon(0.0, 1.5, 0.0),
+            carbon(100.0, 100.0, 100.0), // far beyond the cutoff: dropped
+        ];
+        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        assert_eq!(modes.disconnected(), &[3]);
+        let mut moved = positions(&atoms);
+        moved[3] = [200.0, -50.0, 7.0];
+        assert_relative_eq!(modes.energy(&moved), 0.0);
+    }
+
+    #[test]
+    fn a_displaced_mode_has_positive_energy() {
+        let atoms = cluster();
+        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let displaced = modes.displace(&positions(&atoms), 6, 0.5);
+        assert!(modes.energy(&displaced) > ZERO_EIGENVALUE);
+    }
+
+    #[test]
+    #[should_panic(expected = "one entry per atom")]
+    fn energy_rejects_wrong_length_positions() {
+        let atoms = cluster();
+        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let _ = modes.energy(&[[0.0, 0.0, 0.0]]);
     }
 
     /// Mass-weighting check with a closed-form answer: a diatomic has a single
