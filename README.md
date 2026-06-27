@@ -106,18 +106,31 @@ elasticrab protein.pdb -o mode1.pdb                       # softest mode, bond-p
 elasticrab protein.pdb -n 5 -o anim.xtc                   # five lowest modes -> anim_mode1.xtc …
 elasticrab protein.pdb --select "chain A" --json out.json # restrict atoms; structured report
 elasticrab protein.pdb -n 5 -o pool.xtc --energy e.csv    # merge modes + per-frame energies
+elasticrab protein.pdb --b-factor-fit --frames 0          # fit gamma to the input's B-factors
 ```
 
 It prints a frequency report to stdout (`--json` writes it to a file); run
 `elasticrab --help` for cutoff, amplitude, frame-count, and selection options.
 The interface is similar to NOLB.
 
-`--energy` merges every requested mode into one trajectory (the native structure
-first) and writes a `frame,mode,rmsd,energy` table — the elastic-network spring
-energy of each frame, comparable across modes. Reweight a Monte-Carlo move
-between frames with `exp(−γ·energy / k_B T)` for your chosen γ and temperature.
-`frame` is the 0-based index in trajectory order (a multi-model PDB labels the
-same frame `MODEL frame+1`).
+`--energy` builds a Monte-Carlo conformation pool: it merges every requested mode
+into one trajectory (the native structure first) and writes a
+`frame,mode,rmsd,energy,energy_kJ_mol,weight` table. Each mode is sampled at its
+own **thermal amplitude** — swept over ±`--sigmas` σ (default 3) of its thermal
+fluctuation, sized from γ and the temperature — so the frames are Boltzmann-
+relevant rather than the much larger visualization `--amplitude`. `energy` is the
+geometric spring energy (γ=1, Å²), `energy_kJ_mol` applies the spring constant
+`--gamma` (kJ/mol/Å²), and `weight` is `exp(−energy_kJ_mol / k_B T)` at
+`--temperature` (298.15 K), with the native frame at weight 1. The energy is
+comparable across modes since it depends only on the coordinates. `frame` is the
+0-based index in trajectory order (a multi-model PDB labels it `MODEL frame+1`).
+
+`--b-factor-fit` calibrates γ physically: it matches the ANM's predicted thermal
+fluctuations to the input's crystallographic B-factors and reports the fitted γ
+(with the correlation as a quality check), overriding `--gamma`. The default γ is
+a B-factor-fitted median over a small PDB set (`scripts/calibrate-gamma.sh`);
+since the fit is noisy across structures, pass `--b-factor-fit` for quantitative
+work.
 
 ## Benchmarks
 

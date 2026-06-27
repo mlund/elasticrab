@@ -188,10 +188,10 @@ struct Rtb {
 /// tiny positive *and negative* values a finite-precision solver returns.
 const ZERO_EIGENVALUE: f64 = 1e-6;
 
-/// Boltzmann constant in kcal·mol⁻¹·K⁻¹. The absolute amplitude scale is only
-/// meaningful relative to `gamma` and your unit choices, so callers commonly
-/// rescale the result regardless.
-const BOLTZMANN_KCAL_PER_MOL_K: f64 = 1.987_204_259e-3;
+/// Boltzmann constant in kJ·mol⁻¹·K⁻¹, matching a `gamma` expressed in
+/// kJ·mol⁻¹·Å⁻². The absolute scale of amplitudes and fluctuations is only
+/// meaningful relative to `gamma`, so callers commonly rescale regardless.
+const BOLTZMANN_KJ_PER_MOL_K: f64 = 8.314_462_618e-3;
 
 /// Below this angular speed a block's nonlinear motion is treated as a pure
 /// translation, which also guards the rotation-axis normalization against a
@@ -671,7 +671,7 @@ impl NormalModes {
     /// The absolute scale is arbitrary in an ANM (it rides on `gamma`); the
     /// useful information is the *relative* amplitude across modes.
     pub fn thermal_amplitudes(&self, temperature_k: f64) -> Vec<f64> {
-        let two_kt = 2.0 * BOLTZMANN_KCAL_PER_MOL_K * temperature_k;
+        let two_kt = 2.0 * BOLTZMANN_KJ_PER_MOL_K * temperature_k;
         self.eigenvalues
             .iter()
             .map(|&lambda| {
@@ -681,6 +681,43 @@ impl NormalModes {
                     0.0
                 }
             })
+            .collect()
+    }
+
+    /// Predicted thermal fluctuation `⟨Δrₐ²⟩ = k_BT Σᵢ (1/λᵢ) |vᵢ(a)|²` of each
+    /// atom at temperature `T` (kelvin), summed over the non-zero modes — the
+    /// quantity behind crystallographic B-factors, `B = (8π²/3)⟨Δr²⟩`.
+    ///
+    /// These are *configurational* fluctuations: independent of mass, so for
+    /// physical B-factors build the modes **without** mass-weighting
+    /// ([`Params::mass_weighted`] = `false`). The result is one value per original
+    /// atom; a disconnected atom (zero in every mode) scores 0. With γ in
+    /// kJ/mol/Å² the values are in Å².
+    pub fn fluctuations(&self, temperature_k: f64) -> Vec<f64> {
+        let kt = BOLTZMANN_KJ_PER_MOL_K * temperature_k;
+        let mut msf = vec![0.0; self.n_atoms];
+        for (i, &lambda) in self.eigenvalues.iter().enumerate() {
+            if lambda <= ZERO_EIGENVALUE {
+                continue;
+            }
+            let weight = kt / lambda;
+            for (out, v) in msf.iter_mut().zip(self.eigenvector(i)) {
+                *out += weight * (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            }
+        }
+        msf
+    }
+
+    /// Predicted crystallographic B-factors `B = (8π²/3)⟨Δr²⟩` per atom at
+    /// temperature `T`, from [`fluctuations`](Self::fluctuations) — the standard
+    /// observable for comparing against, or calibrating `gamma` to, an
+    /// experimental structure. Configurational like the fluctuations, so build the
+    /// modes **without** mass-weighting; in Å² when γ is in kJ/mol/Å².
+    pub fn predicted_b_factors(&self, temperature_k: f64) -> Vec<f64> {
+        const PREFACTOR: f64 = 8.0 * std::f64::consts::PI * std::f64::consts::PI / 3.0;
+        self.fluctuations(temperature_k)
+            .into_iter()
+            .map(|msf| PREFACTOR * msf)
             .collect()
     }
 
@@ -898,6 +935,57 @@ mod tests {
         let atoms = cluster();
         let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
         let _ = modes.energy(&[[0.0, 0.0, 0.0]]);
+    }
+
+    /// Eigenvalues scale with γ, so the fluctuations scale as 1/γ.
+    #[test]
+    fn fluctuations_scale_inversely_with_gamma() {
+        let atoms = cluster();
+        let unit = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let stiff = NormalModes::new(
+            &atoms,
+            &Params {
+                gamma: 2.0,
+                ..Params::default()
+            },
+        )
+        .unwrap();
+        for (u, s) in unit
+            .fluctuations(300.0)
+            .iter()
+            .zip(stiff.fluctuations(300.0))
+        {
+            assert_relative_eq!(s, u / 2.0, epsilon = 1e-9);
+        }
+    }
+
+    #[test]
+    fn fluctuations_are_zero_for_a_disconnected_atom() {
+        let atoms = [
+            carbon(0.0, 0.0, 0.0),
+            carbon(1.5, 0.0, 0.0),
+            carbon(0.0, 1.5, 0.0),
+            carbon(100.0, 100.0, 100.0), // dropped
+        ];
+        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let msf = modes.fluctuations(300.0);
+        assert_eq!(msf.len(), atoms.len());
+        assert_relative_eq!(msf[3], 0.0);
+        assert!(msf[0] > 0.0);
+    }
+
+    #[test]
+    fn predicted_b_factors_are_fluctuations_times_the_prefactor() {
+        let atoms = cluster();
+        let modes = NormalModes::new(&atoms, &Params::default()).unwrap();
+        let prefactor = 8.0 * std::f64::consts::PI * std::f64::consts::PI / 3.0;
+        for (msf, b) in modes
+            .fluctuations(300.0)
+            .iter()
+            .zip(modes.predicted_b_factors(300.0))
+        {
+            assert_relative_eq!(b, prefactor * msf);
+        }
     }
 
     /// Mass-weighting check with a closed-form answer: a diatomic has a single

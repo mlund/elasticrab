@@ -15,6 +15,14 @@ use voronota_ltr::input::{
     Selection,
 };
 
+/// Default spring constant (kJ/mol/Å²): the median B-factor-fitted γ over a small
+/// high-resolution PDB set (`scripts/calibrate-gamma.sh`). The fit is noisy across
+/// structures, so for quantitative work pass `--b-factor-fit` or your own `--gamma`.
+const DEFAULT_GAMMA: f64 = 11.5;
+
+/// Boltzmann constant in kJ·mol⁻¹·K⁻¹, matching γ in kJ/mol/Å².
+const BOLTZMANN_KJ_PER_MOL_K: f64 = 8.314_462_618e-3;
+
 /// Normal-mode analysis: animate a protein's softest vibrational modes.
 ///
 /// Reads a PDB or mmCIF structure, builds a mass-weighted rigid-block elastic
@@ -71,17 +79,43 @@ struct Cli {
     #[arg(short, long, value_name = "PATH")]
     output: Option<PathBuf>,
 
-    /// Also write the report (frequencies, counts) as JSON to this file.
+    /// Write the report as JSON to this file.
     #[arg(long, value_name = "FILE")]
     json: Option<PathBuf>,
 
-    /// Merge all modes into one trajectory + a per-frame energy CSV.
+    /// Merge modes into one trajectory + an MC energy CSV.
     ///
-    /// Columns: frame, mode, rmsd (Å), energy (Å², γ=1). Native frame first.
+    /// Each mode is sampled at thermal amplitudes (±--sigmas σ), not --amplitude.
     ///
-    /// Weight a frame by exp(−γ·energy / kT).
+    /// Columns: frame, mode, rmsd, energy (γ=1, Å²), energy_kJ_mol, weight.
     #[arg(long, value_name = "FILE")]
     energy: Option<PathBuf>,
+
+    /// Spring constant γ (kJ/mol/Å²).
+    ///
+    /// Scales the energy and weight columns; the default is B-factor-calibrated.
+    #[arg(short = 'g', long, default_value_t = DEFAULT_GAMMA, value_name = "VALUE")]
+    gamma: f64,
+
+    /// Temperature, in kelvin.
+    ///
+    /// Sets the fluctuations and the Boltzmann weights.
+    #[arg(short = 'T', long, default_value_t = 298.15, value_name = "KELVIN")]
+    temperature: f64,
+
+    /// Fit γ to the input's B-factors; overrides --gamma.
+    ///
+    /// Runs a dense all-atom solve (memory-heavy for very large structures); on
+    /// failure it warns and falls back to --gamma.
+    #[arg(long)]
+    b_factor_fit: bool,
+
+    /// Thermal sampling width for --energy, in σ.
+    ///
+    /// Each mode is swept over ±N·σ of its own thermal fluctuation, so the pool
+    /// is Boltzmann-relevant (peak energy ≈ ½N²·kT).
+    #[arg(long, default_value_t = 3.0, value_name = "N")]
+    sigmas: f64,
 }
 
 /// Entry point: set up diagnostics, parse arguments, run, and turn any error into
@@ -98,6 +132,16 @@ pub fn run() -> ExitCode {
 }
 
 fn execute(cli: &Cli) -> Result<(), String> {
+    for (name, value) in [
+        ("--gamma", cli.gamma),
+        ("--temperature", cli.temperature),
+        ("--sigmas", cli.sigmas),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(format!("{name} must be a positive number (got {value})"));
+        }
+    }
+
     let options = ParseOptions {
         exclude_heteroatoms: !cli.hetatm,
         ..Default::default()
@@ -150,10 +194,11 @@ fn execute(cli: &Cli) -> Result<(), String> {
         }
     }
 
-    report(cli, &records, &blocks, &modes)?;
+    let (gamma, fit_r) = effective_gamma(cli, &atoms, &records)?;
+    report(cli, &records, &blocks, &modes, gamma, fit_r)?;
 
     if let Some(csv) = cli.energy.as_deref() {
-        write_merged(cli, &modes, &positions, &records, &wanted, csv)?;
+        write_merged(cli, &modes, &positions, &records, &wanted, csv, gamma)?;
     } else if cli.frames > 0 {
         let multi = wanted.len() > 1;
         for &m in &wanted {
@@ -177,6 +222,7 @@ fn write_merged(
     records: &[AtomRecord],
     wanted: &[usize],
     csv: &Path,
+    gamma: f64,
 ) -> Result<(), String> {
     if cli.frames == 0 {
         return Err("--energy needs --frames greater than 0 (nothing to score otherwise)".into());
@@ -196,22 +242,33 @@ fn write_merged(
         ));
     }
 
+    // Build a row, deriving the real energy (γ·E_geometric) and Boltzmann weight
+    // (native E=0 ⇒ weight 1, the maximum) from the geometric γ=1 energy.
+    let kt = BOLTZMANN_KJ_PER_MOL_K * cli.temperature;
+    let row = |frame, mode, rmsd, energy: f64| {
+        let energy_kj = gamma * energy;
+        io::EnergyRow {
+            frame,
+            mode,
+            rmsd,
+            energy,
+            energy_kj,
+            weight: (-energy_kj / kt).exp(),
+        }
+    };
+
     // Frame 0 is the native structure — the energy zero and the MC rest state.
     let mut frames = vec![positions.to_vec()];
-    let mut rows = vec![io::EnergyRow {
-        frame: 0,
-        mode: 0,
-        rmsd: 0.0,
-        energy: modes.energy(positions),
-    }];
+    let mut rows = vec![row(0, 0, 0.0, modes.energy(positions))];
     for &m in wanted {
-        for frame in animate(modes, positions, m, cli.amplitude, cli.frames, cli.linear)? {
-            rows.push(io::EnergyRow {
-                frame: frames.len(),
-                mode: m,
-                rmsd: rms_deviation(&frame, positions),
-                energy: modes.energy(&frame),
-            });
+        for frame in thermal_frames(modes, positions, m, gamma, cli)? {
+            let energy = modes.energy(&frame);
+            rows.push(row(
+                frames.len(),
+                m,
+                rms_deviation(&frame, positions),
+                energy,
+            ));
             frames.push(frame);
         }
     }
@@ -231,6 +288,82 @@ fn guard_input(output: &Path, input: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The γ for the energy/weight columns and report: fitted from B-factors when
+/// `--b-factor-fit` is set (returning its correlation too), else `--gamma`.
+fn effective_gamma(
+    cli: &Cli,
+    atoms: &[Atom],
+    records: &[AtomRecord],
+) -> Result<(f64, Option<f64>), String> {
+    if cli.b_factor_fit {
+        match fit_gamma(cli, atoms, records) {
+            Ok((gamma, r)) => Ok((gamma, Some(r))),
+            // A failed fit shouldn't suppress the report and trajectory the user
+            // also asked for; warn and fall back to the manual γ.
+            Err(message) => {
+                eprintln!("warning: {message}; falling back to --gamma {}", cli.gamma);
+                Ok((cli.gamma, None))
+            }
+        }
+    } else {
+        Ok((cli.gamma, None))
+    }
+}
+
+/// Fit γ (kJ/mol/Å²) by scaling predicted ANM fluctuations to the input's
+/// B-factors; returns `(γ, Pearson r)`. Uses a non-mass-weighted all-atom solve —
+/// the correct, mass-independent configurational-fluctuation model — and the
+/// through-origin least-squares `γ = Σ B₁² / Σ B₁·B^exp` (since `B ∝ 1/γ`).
+fn fit_gamma(cli: &Cli, atoms: &[Atom], records: &[AtomRecord]) -> Result<(f64, f64), String> {
+    let mut params = Params::default();
+    params.cutoff = cli.cutoff;
+    params.mass_weighted = false;
+    let modes = NormalModes::new(atoms, &params).map_err(|e| format!("--b-factor-fit: {e}"))?;
+
+    // Predicted B at γ=1, paired with experimental B over the connected atoms
+    // (non-zero prediction) that actually carry a B-factor.
+    let (mut predicted, mut experimental) = (Vec::new(), Vec::new());
+    for (b_pred, record) in modes
+        .predicted_b_factors(cli.temperature)
+        .iter()
+        .zip(records)
+    {
+        if *b_pred > 0.0 && record.b_factor > 0.0 {
+            predicted.push(*b_pred);
+            experimental.push(record.b_factor);
+        }
+    }
+    let sum_pe: f64 = predicted
+        .iter()
+        .zip(&experimental)
+        .map(|(p, e)| p * e)
+        .sum();
+    if predicted.len() < 2 || sum_pe <= 0.0 {
+        return Err("--b-factor-fit: input has no usable B-factors; set --gamma instead".into());
+    }
+    let sum_pp: f64 = predicted.iter().map(|p| p * p).sum();
+    Ok((sum_pp / sum_pe, pearson(&predicted, &experimental)))
+}
+
+/// Pearson correlation of two equal-length series (0 if either is constant).
+fn pearson(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len() as f64;
+    let mean_x = x.iter().sum::<f64>() / n;
+    let mean_y = y.iter().sum::<f64>() / n;
+    let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
+    for (a, b) in x.iter().zip(y) {
+        let (dx, dy) = (a - mean_x, b - mean_y);
+        sxy += dx * dy;
+        sxx += dx * dx;
+        syy += dy * dy;
+    }
+    if sxx <= 0.0 || syy <= 0.0 {
+        0.0
+    } else {
+        sxy / (sxx * syy).sqrt()
+    }
+}
+
 /// The 1-indexed modes to animate: `--mode` if given, otherwise `1..=modes`.
 fn wanted_modes(cli: &Cli) -> Result<Vec<usize>, String> {
     let wanted = if cli.mode.is_empty() {
@@ -247,8 +380,46 @@ fn wanted_modes(cli: &Cli) -> Result<Vec<usize>, String> {
     Ok(wanted)
 }
 
-/// Frames sweeping mode `mode` (1-indexed) back and forth, scaled so the peak
-/// frame reaches `peak_rmsd` ångström from the input.
+/// Mode `mode` (1-indexed) displaced by `factor` along its eigenvector — linear,
+/// or the bond-preserving nonlinear extrapolation.
+fn displace_at(
+    modes: &NormalModes,
+    positions: &[[f64; 3]],
+    mode: usize,
+    factor: f64,
+    linear: bool,
+) -> Result<Vec<[f64; 3]>, String> {
+    let i = mode - 1;
+    if linear {
+        Ok(modes.displace(positions, i, factor))
+    } else {
+        modes
+            .displace_nonlinear(positions, i, factor)
+            .map_err(|e| format!("nonlinear displacement: {e}"))
+    }
+}
+
+/// Frames sweeping mode `mode` over ±`peak` (in displace-factor units) through one
+/// period. The quarter-step phase offset keeps every frame off the rest position,
+/// so even a single-frame sweep is displaced.
+fn sweep(
+    modes: &NormalModes,
+    positions: &[[f64; 3]],
+    mode: usize,
+    peak: f64,
+    frames: usize,
+    linear: bool,
+) -> Result<Vec<Vec<[f64; 3]>>, String> {
+    (0..frames)
+        .map(|f| {
+            let phase = std::f64::consts::TAU * (f as f64 + 0.25) / frames as f64;
+            displace_at(modes, positions, mode, peak * phase.sin(), linear)
+        })
+        .collect()
+}
+
+/// Visualization sweep: scaled so the peak frame reaches `peak_rmsd` ångström
+/// (factor 1.0 is a tiny displacement, so the nonlinear path stays linear there).
 fn animate(
     modes: &NormalModes,
     positions: &[[f64; 3]],
@@ -257,28 +428,30 @@ fn animate(
     frames: usize,
     linear: bool,
 ) -> Result<Vec<Vec<[f64; 3]>>, String> {
-    let i = mode - 1;
-    let displace = |factor: f64| {
-        if linear {
-            Ok(modes.displace(positions, i, factor))
-        } else {
-            modes
-                .displace_nonlinear(positions, i, factor)
-                .map_err(|e| format!("nonlinear displacement: {e}"))
-        }
-    };
-    // Calibrate with the same displacement the frames use, so the requested peak
-    // RMSD is honoured on the nonlinear path too (factor 1.0 stays in the linear
-    // regime, the unit eigenvector being tiny).
-    let scale = peak_rmsd / rms_deviation(&displace(1.0)?, positions);
-    // Offset the phase by half a step: a 1- or 2-frame sweep then still samples
-    // the moving extremes instead of landing only on sin = 0 (a motionless run).
-    (0..frames)
-        .map(|f| {
-            let phase = std::f64::consts::TAU * (f as f64 + 0.5) / frames as f64;
-            displace(scale * phase.sin())
-        })
-        .collect()
+    let unit = displace_at(modes, positions, mode, 1.0, linear)?;
+    let scale = peak_rmsd / rms_deviation(&unit, positions);
+    sweep(modes, positions, mode, scale, frames, linear)
+}
+
+/// Monte-Carlo sweep: ±`--sigmas` of mode `mode`'s thermal width. Each mode's
+/// stiffness `k = 2γ·E(unit)` (from the energy at the tiny unit displacement)
+/// gives `σ = √(kT/k)`, so the pool is Boltzmann-relevant.
+fn thermal_frames(
+    modes: &NormalModes,
+    positions: &[[f64; 3]],
+    mode: usize,
+    gamma: f64,
+    cli: &Cli,
+) -> Result<Vec<Vec<[f64; 3]>>, String> {
+    let unit_energy = modes.energy(&displace_at(modes, positions, mode, 1.0, cli.linear)?);
+    if !unit_energy.is_finite() || unit_energy <= 0.0 {
+        return Err(format!(
+            "mode {mode} has no restoring energy to sample thermally"
+        ));
+    }
+    let kt = BOLTZMANN_KJ_PER_MOL_K * cli.temperature;
+    let peak = cli.sigmas * (kt / (2.0 * gamma * unit_energy)).sqrt();
+    sweep(modes, positions, mode, peak, cli.frames, cli.linear)
 }
 
 fn rms_deviation(a: &[[f64; 3]], b: &[[f64; 3]]) -> f64 {
@@ -355,6 +528,8 @@ fn report(
     records: &[AtomRecord],
     blocks: &[usize],
     modes: &NormalModes,
+    gamma: f64,
+    fit_r: Option<f64>,
 ) -> Result<(), String> {
     let residues = blocks.iter().copied().max().map_or(0, |m| m + 1);
     let frequencies: Vec<f64> = modes.eigenvalues().iter().map(|&l| l.sqrt()).collect();
@@ -366,13 +541,25 @@ fn report(
         modes.disconnected().len()
     );
     println!("  cutoff {} Å, mass-weighted", cli.cutoff);
+    match fit_r {
+        Some(r) => println!("  gamma {gamma:.4} kJ/mol/Å² (fitted, B-factor r = {r:.3})"),
+        None => println!("  gamma {gamma:.4} kJ/mol/Å²"),
+    }
     println!("  mode  frequency");
     for (j, frequency) in frequencies.iter().enumerate() {
         println!("  {:>4}  {frequency:.6}", j + 1);
     }
 
     if let Some(path) = &cli.json {
-        let json = report_json(cli, records.len(), residues, modes, &frequencies);
+        let json = report_json(
+            cli,
+            records.len(),
+            residues,
+            modes,
+            &frequencies,
+            gamma,
+            fit_r,
+        );
         std::fs::write(path, json).map_err(|e| format!("writing {}: {e}", path.display()))?;
     }
     Ok(())
@@ -386,6 +573,8 @@ fn report_json(
     residues: usize,
     modes: &NormalModes,
     frequencies: &[f64],
+    gamma: f64,
+    fit_r: Option<f64>,
 ) -> String {
     let dropped: Vec<String> = modes.disconnected().iter().map(usize::to_string).collect();
     let mut s = String::from("{\n");
@@ -399,6 +588,10 @@ fn report_json(
     let _ = writeln!(s, "  \"dropped\": [{}],", dropped.join(", "));
     let _ = writeln!(s, "  \"cutoff\": {},", cli.cutoff);
     let _ = writeln!(s, "  \"mass_weighted\": true,");
+    let _ = writeln!(s, "  \"gamma\": {gamma},");
+    if let Some(r) = fit_r {
+        let _ = writeln!(s, "  \"b_factor_correlation\": {r},");
+    }
     s.push_str("  \"modes\": [\n");
     let eigenvalues = modes.eigenvalues();
     for (j, (frequency, eigenvalue)) in frequencies.iter().zip(eigenvalues).enumerate() {

@@ -19,7 +19,12 @@ pub struct EnergyRow {
     /// 1-based mode index; `0` marks the native (input) frame.
     pub mode: usize,
     pub rmsd: f64,
+    /// Geometric spring energy at γ=1, in Å².
     pub energy: f64,
+    /// Real energy `γ·energy`, in kJ/mol.
+    pub energy_kj: f64,
+    /// Boltzmann weight `exp(−energy_kj / kT)` (native = 1).
+    pub weight: f64,
 }
 
 /// Standard atomic weights for the common protein elements; a neutral fallback
@@ -39,19 +44,19 @@ fn writing(path: &Path, e: &std::io::Error) -> String {
     format!("writing {}: {e}", path.display())
 }
 
-/// Write the energy table as CSV (`frame,mode,rmsd,energy`), one row per frame in
-/// the merged trajectory's order, streamed row by row.
+/// Write the energy table as CSV (`frame,mode,rmsd,energy,energy_kJ_mol,weight`),
+/// one row per frame in the merged trajectory's order, streamed row by row.
 pub fn write_csv(path: &Path, rows: &[EnergyRow]) -> Result<(), String> {
     let file = File::create(path).map_err(|e| writing(path, &e))?;
     let mut writer = BufWriter::new(file);
     writer
-        .write_all(b"frame,mode,rmsd,energy\n")
+        .write_all(b"frame,mode,rmsd,energy,energy_kJ_mol,weight\n")
         .map_err(|e| writing(path, &e))?;
     for r in rows {
         writeln!(
             writer,
-            "{},{},{:.6},{:.6}",
-            r.frame, r.mode, r.rmsd, r.energy
+            "{},{},{:.6},{:.6},{:.6},{:.6e}",
+            r.frame, r.mode, r.rmsd, r.energy, r.energy_kj, r.weight
         )
         .map_err(|e| writing(path, &e))?;
     }
