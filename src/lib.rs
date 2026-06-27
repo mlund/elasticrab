@@ -115,6 +115,10 @@ pub enum Error {
     NoNetwork,
     /// An explicit [`Spring`] referenced an atom out of range, or itself.
     InvalidSpring,
+    /// Two connected atoms occupy (almost) the same position, giving a
+    /// zero-length spring the Hessian's `1/d²` term cannot handle — usually a
+    /// retained alternate-location or duplicate atom record.
+    CoincidentAtoms,
 }
 
 impl std::fmt::Display for Error {
@@ -128,6 +132,7 @@ impl std::fmt::Display for Error {
             Self::NotRigidBlocks => write!(f, "nonlinear modes require rigid blocks"),
             Self::NoNetwork => write!(f, "no network: set a cutoff or springs"),
             Self::InvalidSpring => write!(f, "a spring references an invalid atom"),
+            Self::CoincidentAtoms => write!(f, "two connected atoms share a position"),
         }
     }
 }
@@ -210,6 +215,11 @@ const BOLTZMANN_KJ_PER_MOL_K: f64 = 8.314_462_618e-3;
 /// translation, which also guards the rotation-axis normalization against a
 /// near-zero vector.
 const ROTATION_EPS: f64 = 1e-12;
+
+/// A spring shorter than this (squared, Å²) is treated as a zero-length spring
+/// between coincident atoms — `1e-6 Å²` is a 0.001 Å separation, far below any
+/// real interatomic distance, so this only fires on duplicate/altloc artifacts.
+const MIN_CONTACT_DIST_SQ: f64 = 1e-6;
 
 /// Shared validation: per-atom positions and raw masses. Coordinates must be
 /// finite; masses are checked finite-and-positive only when `mass_weighted`,
@@ -303,6 +313,11 @@ fn build_network(
         (None, Some(s)) => network::contacts_from_edges(&positions, s)?,
         _ => return Err(Error::NoNetwork),
     };
+    // A zero-length spring makes the Hessian's `-γ/d²` term blow up to NaN, so
+    // reject coincident atoms rather than emit a spectrum of NaNs.
+    if contacts.iter().any(|c| c.dist2 < MIN_CONTACT_DIST_SQ) {
+        return Err(Error::CoincidentAtoms);
+    }
     let net = drop_disconnected(positions, masses, contacts);
     if net.keep.len() < 2 {
         return Err(Error::TooFewAtoms);
@@ -569,6 +584,13 @@ impl NormalModes {
     /// as the conventional companion to [`len`](Self::len).
     pub const fn is_empty(&self) -> bool {
         self.eigenvalues.is_empty()
+    }
+
+    /// Number of springs in the network — the edges that survived the
+    /// disconnected-atom drop. Useful for comparing connectivity between a
+    /// distance cutoff and a tessellation network.
+    pub const fn spring_count(&self) -> usize {
+        self.springs.len()
     }
 
     /// Eigenvalues in ascending order. The first ~6 are approximately zero.
@@ -1644,5 +1666,52 @@ mod tests {
             NormalModes::builder(&atoms).solve().unwrap_err(),
             Error::NoNetwork
         );
+    }
+
+    #[test]
+    fn coincident_atoms_are_rejected() {
+        // A duplicate atom at an existing position: the zero-length spring would
+        // make the Hessian's 1/d² term blow up, so the solve must reject it.
+        let atoms = [
+            carbon(0.0, 0.0, 0.0),
+            carbon(0.0, 0.0, 0.0),
+            carbon(1.5, 0.0, 0.0),
+        ];
+        assert_eq!(
+            NormalModes::builder(&atoms)
+                .cutoff(5.0)
+                .solve()
+                .unwrap_err(),
+            Error::CoincidentAtoms
+        );
+    }
+
+    #[test]
+    fn spring_count_reports_network_size() {
+        let atoms = [
+            carbon(0.0, 0.0, 0.0),
+            carbon(1.0, 0.0, 0.0),
+            carbon(0.0, 1.0, 0.0),
+        ];
+        // All three pairs are within the cutoff: the triangle has three springs.
+        let by_cutoff = NormalModes::builder(&atoms).cutoff(15.0).solve().unwrap();
+        assert_eq!(by_cutoff.spring_count(), 3);
+        // An explicit two-edge path keeps exactly those two springs.
+        let by_edges = NormalModes::builder(&atoms)
+            .springs(&[
+                Spring {
+                    i: 0,
+                    j: 1,
+                    weight: 1.0,
+                },
+                Spring {
+                    i: 1,
+                    j: 2,
+                    weight: 1.0,
+                },
+            ])
+            .solve()
+            .unwrap();
+        assert_eq!(by_edges.spring_count(), 2);
     }
 }

@@ -9,11 +9,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use elasticrab::{Atom, NormalModes};
+use elasticrab::{Atom, Builder, NormalModes, Spring};
 use voronota_ltr::input::{
     build_residue_grouping, parse_file_with_records, AtomRecord, ParseOptions, RadiiLookup,
     Selection,
 };
+use voronota_ltr::{compute_contacts_only, Ball};
 
 /// Default spring constant (kJ/mol/Å²): the median B-factor-fitted γ over a small
 /// high-resolution PDB set (`scripts/calibrate-gamma.sh`). The fit is noisy across
@@ -36,6 +37,12 @@ struct Cli {
     /// Spring interaction cutoff, in ångström.
     #[arg(short, long, default_value_t = 5.0, value_name = "ANGSTROM")]
     cutoff: f64,
+
+    /// Build springs from a Voronoi tessellation (contact-area weighted).
+    ///
+    /// Mutually exclusive with --cutoff.
+    #[arg(long, conflicts_with = "cutoff")]
+    voronota: bool,
 
     /// Animate the N lowest modes (1 = softest).
     ///
@@ -146,7 +153,9 @@ fn execute(cli: &Cli) -> Result<(), String> {
         exclude_heteroatoms: !cli.hetatm,
         ..Default::default()
     };
-    let parsed = parse_file_with_records(&cli.input, &options, &RadiiLookup::new())
+    // One radii table, shared by the parser and the tessellation (--voronota).
+    let radii = RadiiLookup::new();
+    let parsed = parse_file_with_records(&cli.input, &options, &radii)
         .map_err(|e| format!("reading {}: {e}", cli.input.display()))?;
     let mut records = parsed.records;
 
@@ -176,16 +185,25 @@ fn execute(cli: &Cli) -> Result<(), String> {
         .map(|&g| g as usize)
         .collect();
 
+    // Tessellation springs (when --voronota); otherwise the distance cutoff is used.
+    let springs = cli
+        .voronota
+        .then(|| voronota_springs(&records, &radii))
+        .transpose()?;
+
     let wanted = wanted_modes(cli)?;
     let k = *wanted.iter().max().expect("wanted is non-empty");
 
-    let modes = NormalModes::builder(&atoms)
-        .cutoff(cli.cutoff)
-        .mass_weighted()
-        .k_modes(k)
-        .blocks(&blocks)
-        .solve()
-        .map_err(|e| format!("normal-mode analysis failed: {e}"))?;
+    let modes = with_connectivity(
+        NormalModes::builder(&atoms)
+            .mass_weighted()
+            .k_modes(k)
+            .blocks(&blocks),
+        cli.cutoff,
+        springs.as_deref(),
+    )
+    .solve()
+    .map_err(|e| format!("normal-mode analysis failed: {e}"))?;
     for &m in &wanted {
         if m > modes.len() {
             return Err(format!(
@@ -195,7 +213,7 @@ fn execute(cli: &Cli) -> Result<(), String> {
         }
     }
 
-    let (gamma, fit_r) = effective_gamma(cli, &atoms, &records)?;
+    let (gamma, fit_r) = effective_gamma(cli, &atoms, &records, springs.as_deref())?;
     report(cli, &records, &blocks, &modes, gamma, fit_r)?;
 
     if let Some(csv) = cli.energy.as_deref() {
@@ -207,6 +225,7 @@ fn execute(cli: &Cli) -> Result<(), String> {
             guard_input(&path, &cli.input)?;
             let frames = animate(&modes, &positions, m, cli.amplitude, cli.frames, cli.linear)?;
             write_trajectory(&path, &records, &frames)?;
+            println!("  wrote {}", path.display());
         }
     }
     Ok(())
@@ -275,7 +294,9 @@ fn write_merged(
     }
 
     write_trajectory(&traj, records, &frames)?;
-    io::write_csv(csv, &rows)
+    io::write_csv(csv, &rows)?;
+    println!("  wrote {} and {}", traj.display(), csv.display());
+    Ok(())
 }
 
 /// Refuse to write a trajectory over the input structure.
@@ -289,15 +310,59 @@ fn guard_input(output: &Path, input: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Probe radius (ångström) for the Voronoi tessellation — the conventional water
+/// probe, as used by voronota and VoroMQA.
+const VORONOTA_PROBE: f64 = 1.4;
+
+/// Configure the builder's connectivity: explicit tessellation springs when
+/// `--voronota` produced them, otherwise the distance cutoff. Shared by the main
+/// solve and the B-factor fit so both use the same network.
+fn with_connectivity<'a>(
+    builder: Builder<'a>,
+    cutoff: f64,
+    springs: Option<&'a [Spring]>,
+) -> Builder<'a> {
+    match springs {
+        Some(s) => builder.springs(s),
+        None => builder.cutoff(cutoff),
+    }
+}
+
+/// Springs from the Voronoi/Laguerre tessellation: one per pair of atoms whose
+/// cells share a face, weighted by the contact area `Aᵢⱼ` normalized to unit mean
+/// (`weight = Aᵢⱼ / mean A`, so `γᵢⱼ = γ₀ · weight`). Unit-mean keeps the *average*
+/// spring at `γ₀`; the networks still differ in connectivity, so absolute
+/// frequencies and energies are not identical to the cutoff network's.
+fn voronota_springs(records: &[AtomRecord], radii: &RadiiLookup) -> Result<Vec<Spring>, String> {
+    let balls: Vec<Ball> = records
+        .iter()
+        .map(|r| Ball::new(r.x, r.y, r.z, radii.get_radius(&r.res_name, &r.name)))
+        .collect();
+    let contacts = compute_contacts_only(&balls, VORONOTA_PROBE, None, None);
+    if contacts.is_empty() {
+        return Err("--voronota: tessellation produced no contacts".into());
+    }
+    let mean = contacts.iter().map(|c| c.area).sum::<f64>() / contacts.len() as f64;
+    Ok(contacts
+        .iter()
+        .map(|c| Spring {
+            i: c.id_a,
+            j: c.id_b,
+            weight: c.area / mean,
+        })
+        .collect())
+}
+
 /// The γ for the energy/weight columns and report: fitted from B-factors when
 /// `--b-factor-fit` is set (returning its correlation too), else `--gamma`.
 fn effective_gamma(
     cli: &Cli,
     atoms: &[Atom],
     records: &[AtomRecord],
+    springs: Option<&[Spring]>,
 ) -> Result<(f64, Option<f64>), String> {
     if cli.b_factor_fit {
-        match fit_gamma(cli, atoms, records) {
+        match fit_gamma(cli, atoms, records, springs) {
             Ok((gamma, r)) => Ok((gamma, Some(r))),
             // A failed fit shouldn't suppress the report and trajectory the user
             // also asked for; warn and fall back to the manual γ.
@@ -315,9 +380,13 @@ fn effective_gamma(
 /// B-factors; returns `(γ, Pearson r)`. Uses a non-mass-weighted all-atom solve —
 /// the correct, mass-independent configurational-fluctuation model — and the
 /// through-origin least-squares `γ = Σ B₁² / Σ B₁·B^exp` (since `B ∝ 1/γ`).
-fn fit_gamma(cli: &Cli, atoms: &[Atom], records: &[AtomRecord]) -> Result<(f64, f64), String> {
-    let modes = NormalModes::builder(atoms)
-        .cutoff(cli.cutoff)
+fn fit_gamma(
+    cli: &Cli,
+    atoms: &[Atom],
+    records: &[AtomRecord],
+    springs: Option<&[Spring]>,
+) -> Result<(f64, f64), String> {
+    let modes = with_connectivity(NormalModes::builder(atoms), cli.cutoff, springs)
         .solve()
         .map_err(|e| format!("--b-factor-fit: {e}"))?;
 
@@ -541,7 +610,18 @@ fn report(
         records.len(),
         modes.disconnected().len()
     );
-    println!("  cutoff {} Å, mass-weighted", cli.cutoff);
+    if cli.voronota {
+        println!(
+            "  Voronoi tessellation, {} springs, mass-weighted",
+            modes.spring_count()
+        );
+    } else {
+        println!(
+            "  cutoff {} Å, {} springs, mass-weighted",
+            cli.cutoff,
+            modes.spring_count()
+        );
+    }
     match fit_r {
         Some(r) => println!("  gamma {gamma:.4} kJ/mol/Å² (fitted, B-factor r = {r:.3})"),
         None => println!("  gamma {gamma:.4} kJ/mol/Å²"),
@@ -587,7 +667,14 @@ fn report_json(
     let _ = writeln!(s, "  \"atoms\": {atoms},");
     let _ = writeln!(s, "  \"residues\": {residues},");
     let _ = writeln!(s, "  \"dropped\": [{}],", dropped.join(", "));
-    let _ = writeln!(s, "  \"cutoff\": {},", cli.cutoff);
+    // `network` is always present as the discriminator; `cutoff` only when it applies.
+    if cli.voronota {
+        let _ = writeln!(s, "  \"network\": \"voronota\",");
+    } else {
+        let _ = writeln!(s, "  \"network\": \"cutoff\",");
+        let _ = writeln!(s, "  \"cutoff\": {},", cli.cutoff);
+    }
+    let _ = writeln!(s, "  \"springs\": {},", modes.spring_count());
     let _ = writeln!(s, "  \"mass_weighted\": true,");
     let _ = writeln!(s, "  \"gamma\": {gamma},");
     if let Some(r) = fit_r {
@@ -627,4 +714,35 @@ fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tessellation yields a connected, area-weighted spring network on a real
+    /// structure: more springs than atoms, every weight finite and positive, every
+    /// endpoint in range.
+    #[test]
+    fn voronota_springs_on_crambin() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/crambin_heavy.pdb");
+        let options = ParseOptions {
+            exclude_heteroatoms: true,
+            ..Default::default()
+        };
+        let radii = RadiiLookup::new();
+        let parsed = parse_file_with_records(Path::new(path), &options, &radii).unwrap();
+        let n = parsed.records.len();
+
+        let springs = voronota_springs(&parsed.records, &radii).unwrap();
+        assert!(
+            springs.len() > n,
+            "expected more springs ({}) than atoms ({n})",
+            springs.len()
+        );
+        for s in &springs {
+            assert!(s.i < n && s.j < n && s.i != s.j, "bad endpoints: {s:?}");
+            assert!(s.weight.is_finite() && s.weight > 0.0, "bad weight: {s:?}");
+        }
+    }
 }

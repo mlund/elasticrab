@@ -111,11 +111,20 @@ elasticrab protein.pdb -n 5 -o anim.xtc                   # five lowest modes ->
 elasticrab protein.pdb --select "chain A" --json out.json # restrict atoms; structured report
 elasticrab protein.pdb -n 5 -o pool.xtc --energy e.csv    # merge modes + per-frame energies
 elasticrab protein.pdb --b-factor-fit --frames 0          # fit gamma to the input's B-factors
+elasticrab protein.pdb --voronota -o mode1.pdb            # area-weighted Voronoi springs, not a cutoff
 ```
 
 It prints a frequency report to stdout (`--json` writes it to a file); run
 `elasticrab --help` for cutoff, amplitude, frame-count, and selection options.
 The interface is similar to NOLB.
+
+`--voronota` replaces the distance cutoff with a Voronoi tessellation: a spring
+joins each pair of atoms whose cells share a face, weighted by its contact area,
+so stiffness follows how much two atoms actually pack together. Areas are
+normalized to unit mean (`γᵢⱼ = γ₀·area / mean_area`), so the *average* spring
+matches `γ₀`; the network still differs in connectivity from the cutoff one, so
+absolute frequencies and energies are not directly comparable between the two. It
+is parameter-free (no cutoff) and mutually exclusive with `--cutoff`.
 
 `--energy` builds a Monte-Carlo conformation pool: it merges every requested mode
 into one trajectory (the native structure first) and writes a
@@ -131,7 +140,8 @@ comparable across modes since it depends only on the coordinates. `frame` is the
 
 `--b-factor-fit` calibrates γ physically: it matches the ANM's predicted thermal
 fluctuations to the input's crystallographic B-factors and reports the fitted γ
-(with the correlation as a quality check), overriding `--gamma`. The default γ is
+(with the correlation as a quality check), overriding `--gamma` (and falling back
+to it if the fit fails). The default γ is
 a B-factor-fitted median over a small PDB set (`scripts/calibrate-gamma.sh`);
 since the fit is noisy across structures, pass `--b-factor-fit` for quantitative
 work.
