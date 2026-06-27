@@ -32,7 +32,8 @@ let amplitudes  = modes.thermal_amplitudes(300.0);
 - **Rigid blocks (RTB)** — the Rotation-Translation Blocks reduction of Pepsi-SAXS / NOLB.
 - **Partial solver** (`Params::k_modes`) — return just the lowest *k* modes; `sparse` makes it scale to large systems (and adds a SIMD dense solver), `parallel` multi-threads.
 - **Cell-list neighbour search** — linear in atom count; disconnected atoms are dropped, as Pepsi-SAXS / NOLB do.
-- **Mode visualization** — linear and NOLB nonlinear (bond-preserving) displacement; the `animate_pdb` example writes a multi-model PDB.
+- **Mode visualization** — linear and NOLB nonlinear (bond-preserving) displacement.
+- **Command-line tool** (`cli` feature) — the `elasticrab` binary animates modes into PDB/XTC trajectories, with PDB/mmCIF input, VMD-like atom selection, and a JSON report.
 - **Tests** (`cargo test`) — property, analytic, and golden tests: exact ProDy spectra (1UBI, 2GB1) and ~6-digit NOLB agreement (crambin), including the disconnected-atom drop.
 - **Fixtures** — vendored reference data (ProDy Hessians and eigenvalues, NOLB frequencies), so tests need no external binary.
 
@@ -85,11 +86,29 @@ the rigid-body null space, the diatomic reduced-mass relation
 along mode `i` — sweep `amplitude` to make a trajectory you can watch.
 `displace_nonlinear` instead moves each rigid block as a rigid body (NOLB's
 nonlinear extrapolation), keeping bonds rigid at large amplitude. The
-`animate_pdb` example turns a mode into a multi-model PDB for PyMOL or VMD:
+[command-line tool](#command-line-tool) wraps this into ready-made PDB or XTC
+trajectories.
+
+## Command-line tool
+
+The `elasticrab` binary runs the analysis and writes mode-animation trajectories
+for PyMOL or VMD. Install it from the repository:
 
 ```sh
-cargo run --example animate_pdb -- protein.pdb > mode6.pdb   # [peak-rmsd-Å] [mode] [frames] [--nonlinear]
+cargo install --git https://github.com/mlund/elasticrab --features cli
 ```
+
+Then animate the softest modes of a structure (PDB or mmCIF):
+
+```sh
+elasticrab protein.pdb -o mode1.pdb                       # softest mode, bond-preserving
+elasticrab protein.pdb -n 5 -o anim.xtc                   # five lowest modes -> anim_mode1.xtc …
+elasticrab protein.pdb --select "chain A" --json out.json # restrict atoms; structured report
+```
+
+It prints a frequency report to stdout (`--json` writes it to a file); run
+`elasticrab --help` for cutoff, amplitude, frame-count, and selection options.
+The interface is similar to NOLB.
 
 ## Benchmarks
 

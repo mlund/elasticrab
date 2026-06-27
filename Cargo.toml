@@ -11,9 +11,9 @@ readme = "README.md"
 keywords = ["normal-modes", "anm", "elastic-network", "biophysics", "nma"]
 categories = ["science"]
 
-# Build docs.rs with every feature so the SIMD/parallel paths are documented.
+# Build docs.rs with the SIMD/parallel paths documented (not the CLI binary deps).
 [package.metadata.docs.rs]
-all-features = true
+features = ["parallel"]
 
 [features]
 # Partial eigensolver for the lowest non-zero modes, and a SIMD dense solver.
@@ -21,10 +21,22 @@ sparse = ["dep:faer"]
 # Multi-threaded faer kernels (rayon): faster on large systems, but results
 # differ from the serial build at the ULP level (parallel float reductions).
 parallel = ["sparse", "faer/rayon"]
+# Command-line tool (the `elasticrab` binary): mode animation to PDB/XTC.
+cli = ["sparse", "dep:clap", "dep:voronota-ltr", "dep:molly", "dep:log", "dep:env_logger"]
 
 [dependencies]
 nalgebra = { version = "0.35", default-features = false, features = ["std"] }
 faer = { version = "0.24", optional = true, default-features = false, features = ["std", "sparse-linalg"] }
+# CLI-only dependencies.
+clap = { version = "4.6", optional = true, features = ["derive"] }
+voronota-ltr = { version = "0.4", optional = true }
+molly = { version = "0.6", optional = true }
+log = { version = "0.4", optional = true }
+env_logger = { version = "0.11", optional = true }
+
+[[bin]]
+name = "elasticrab"
+required-features = ["cli"]
 
 [dev-dependencies]
 approx = "0.5"
