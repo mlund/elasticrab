@@ -127,7 +127,9 @@ temperature — so the frames are Boltzmann-relevant, not the much larger
 visualization `--amplitude`. Every row's energy is referenced to the native frame
 and scaled by `--gamma` ($\gamma$):
 
-$$E = E_\text{frame} - E_\text{native}, \qquad E_\text{kJ/mol} = \gamma\,E, \qquad w = \exp\!\left(-\frac{\gamma\,E}{RT}\right),$$
+```math
+E = E_\text{frame} - E_\text{native}, \qquad E_\text{kJ/mol} = \gamma E, \qquad w = \exp\left(-\frac{\gamma E}{RT}\right)
+```
 
 with $R$ the molar gas constant and $T$ = `--temperature` (the native row is then
 $`E=0`$, $`w=1`$). By default $`E_\text{frame}`$ is the spring energy; `--voromqa`
@@ -157,15 +159,19 @@ springs (`--voronota`) and for scoring (`--voromqa`).
 pair within `--cutoff` with equal stiffness. `--voronota` instead springs each
 contacting pair, with a per-edge weight set by its contact area:
 
-$$w_{ij} = \frac{A_{ij}}{\bar A}, \qquad \bar A = \frac{1}{N_c} \sum_{(i,j)} A_{ij}$$
+```math
+w_{ij} = \frac{A_{ij}}{\bar{A}}, \qquad \bar{A} = \frac{1}{N_c} \sum_{(i,j)} A_{ij}
+```
 
 ($`w_{ij} = 1`$ for the cutoff network; $`N_c`$ is the number of contacts). A larger
 shared face is a stiffer spring, and normalizing to unit mean keeps the average
 weight at 1, so `--gamma` keeps its meaning. The harmonic energy of a conformation is
 
-$$E_\text{spring} = \tfrac12\,\gamma \sum_{(i,j)} w_{ij}\,\bigl(\lvert \mathbf{r}_{ij} \rvert - d^0_{ij}\bigr)^2,$$
+```math
+E_\text{spring} = \tfrac{1}{2} \gamma \sum_{(i,j)} w_{ij} \bigl( \lvert \mathbf{r}_{ij} \rvert - d_{ij}^0 \bigr)^2
+```
 
-with $`\mathbf{r}_{ij} = \mathbf{r}_j - \mathbf{r}_i`$ and $`d^0_{ij}`$ the native
+with $`\mathbf{r}_{ij} = \mathbf{r}_j - \mathbf{r}_i`$ and $`d_{ij}^0`$ the native
 separation (so the native structure has $`E_\text{spring} = 0`$). The two networks
 feed the same Hessian and energy; only the pair set and the weights $`w_{ij}`$
 differ, so their absolute frequencies are not directly comparable. `--voronota` is
@@ -176,7 +182,9 @@ with the [VoroMQA](https://github.com/kliment-olechnovic/voronota) contact-area
 potential (bundled v1), Boltzmann-inverted from the PDB, in place of the spring
 energy:
 
-$$E_\text{VoroMQA} = \sum_{(i,j)} A_{ij}\,e(t_i, t_j, c_{ij}) \;+\; \sum_a S_a\,e(t_a, \text{solvent}).$$
+```math
+E_\text{VoroMQA} = \sum_{(i,j)} A_{ij}\, e(t_i, t_j, c_{ij}) + \sum_a S_a\, e(t_a, \text{solvent})
+```
 
 Here $`t_a`$ is atom $a$'s type, $`e(\cdot)`$ a tabulated energy per unit area, $`S_a`$
 the solvent-accessible area of atom $a$ (its one-body burial term), and $`c_{ij}`$ the
