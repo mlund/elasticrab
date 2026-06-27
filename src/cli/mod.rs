@@ -401,7 +401,7 @@ const VORONOTA_PROBE: f64 = 1.4;
 /// Configure the builder's connectivity: explicit tessellation springs when
 /// `--voronota` produced them, otherwise the distance cutoff. Shared by the main
 /// solve and the B-factor fit so both use the same network.
-fn with_connectivity<'a>(
+const fn with_connectivity<'a>(
     builder: Builder<'a>,
     cutoff: f64,
     springs: Option<&'a [Spring]>,

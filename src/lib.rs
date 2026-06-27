@@ -32,10 +32,15 @@
 //! without forming the dense Hessian, which is what scales to large systems.
 
 #![deny(missing_docs)]
-// Deliberate choices that conflict with two `clippy::nursery` lints:
-// `pub(crate)` is kept in private modules as explicit intent (vs. bare `pub`),
-// and the hot distance loop favors a readable sum over fused multiply-add.
-#![allow(clippy::redundant_pub_crate, clippy::suboptimal_flops)]
+// Deliberate choices that conflict with three `clippy::nursery` lints:
+// `pub(crate)` is kept in private modules as explicit intent (vs. bare `pub`); the
+// hot distance loop favors a readable sum over fused multiply-add; and the binary
+// `Some`/`None` solve dispatch reads clearer as a `match` than `map_or_else`.
+#![allow(
+    clippy::redundant_pub_crate,
+    clippy::suboptimal_flops,
+    clippy::option_if_let_else
+)]
 
 mod eigen;
 mod hessian;
@@ -139,8 +144,9 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// One spring of an explicit elastic network: two atoms (by index into the
-/// `atoms` slice) and a relative stiffness `weight`. Pass these to
+/// One spring of an explicit elastic network: two atoms and a relative `weight`.
+///
+/// The atoms are given by index into the `atoms` slice. Pass these to
 /// [`Builder::springs`] — e.g. Voronoi contacts weighted by area. The effective
 /// spring constant is `gamma · weight`, and the rest length is the atoms'
 /// equilibrium separation, so only the connectivity and weight are given here.

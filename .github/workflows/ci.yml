@@ -32,7 +32,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets ${{ matrix.features }} -- -D clippy::nursery
+        # `-D warnings` gates on the stable clippy lints (+ rustc warnings); the
+        # nursery group is unstable across toolchains, so it stays a manual check.
+      - run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
 
   test:
     name: test (${{ matrix.features || 'default' }})
