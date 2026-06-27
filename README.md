@@ -119,26 +119,21 @@ It prints a frequency report to stdout (`--json` writes it to a file); run
 `elasticrab --help` for cutoff, amplitude, frame-count, and selection options.
 The interface is similar to NOLB.
 
-`--voronota` replaces the distance cutoff with a Voronoi tessellation: a spring
-joins each pair of atoms whose cells share a face, weighted by its contact area,
-so stiffness follows how much two atoms actually pack together. Areas are
-normalized to unit mean (`γᵢⱼ = γ₀·area / mean_area`), so the *average* spring
-matches `γ₀`; the network still differs in connectivity from the cutoff one, so
-absolute frequencies and energies are not directly comparable between the two. It
-is parameter-free (no cutoff) and mutually exclusive with `--cutoff`.
-
 `--energy` builds a Monte-Carlo conformation pool: it merges every requested mode
-into one trajectory (the native structure first) and writes a
-`frame,mode,rmsd,energy,energy_kJ_mol,weight` table. Each mode is sampled at its
-own **thermal amplitude** — swept over ±`--sigmas` σ (default 3) of its thermal
-fluctuation, sized from γ and the temperature — so the frames are Boltzmann-
-relevant rather than the much larger visualization `--amplitude`. `energy` is the
-geometric spring energy relative to the native (γ=1, Å²), `energy_kJ_mol` applies
-the spring constant `--gamma` (kJ/mol/Å²), and `weight` is `exp(−energy_kJ_mol / RT)`
-at `--temperature` (298.15 K) — `RT`, since the energy is molar — with the native
-frame at weight 1. The energy is
-comparable across modes since it depends only on the coordinates. `frame` is the
-0-based index in trajectory order (a multi-model PDB labels it `MODEL frame+1`).
+into one trajectory (native frame first) and writes a
+`frame,mode,rmsd,energy,energy_kJ_mol,weight` table. Each mode is swept over
+±`--sigmas` σ (default 3) of its own **thermal amplitude** — sized from γ and the
+temperature — so the frames are Boltzmann-relevant, not the much larger
+visualization `--amplitude`. Every row's energy is referenced to the native frame
+and scaled by `--gamma` ($\gamma$):
+
+$$E = E_\text{frame} - E_\text{native}, \qquad E_\text{kJ/mol} = \gamma\,E, \qquad w = \exp\!\left(-\frac{\gamma\,E}{RT}\right),$$
+
+with $R$ the molar gas constant and $T$ = `--temperature` (the native row is then
+$E=0$, $w=1$). By default $E_\text{frame}$ is the spring energy; `--voromqa`
+substitutes the VoroMQA score — both defined under
+[Voronoi tessellation](#voronoi-tessellation). `frame` is the 0-based trajectory
+index (a multi-model PDB labels it `MODEL frame+1`).
 
 `--b-factor-fit` calibrates γ physically: it matches the ANM's predicted thermal
 fluctuations to the input's crystallographic B-factors and reports the fitted γ
@@ -148,15 +143,52 @@ a B-factor-fitted median over a small PDB set (`scripts/calibrate-gamma.sh`);
 since the fit is noisy across structures, pass `--b-factor-fit` for quantitative
 work.
 
-`--voromqa` makes the `--energy` table use a knowledge-based
-[VoroMQA](https://github.com/kliment-olechnovic/voronota) contact-area energy
-(bundled v1 potential), re-tessellated per frame, **in place of** the spring energy —
-a more physical empirical energy for reweighting. The `energy` column is referenced
-to the native frame (native = 0), and `--gamma` scales it into `energy_kJ_mol` and
-`weight` exactly as for the spring: both energies are area-based (Å²), so γ is a
-tuning knob with the right units (kJ/mol/Å²). Its B-factor-fitted default suits the
-spring; tune it for VoroMQA. `--voromqa-file <path>` supplies a different potential;
-the two are mutually exclusive, and both require `--energy`.
+## Voronoi tessellation
+
+A Laguerre (radical) tessellation of the atoms — each inflated by a 1.4 Å solvent
+probe — gives one cell per atom. Two atoms *contact* when their cells share a face,
+and the face area $A_{ij}$ measures how much they pack together. The contact network
+is parameter-free (no cutoff) and occlusion-aware: an atom between two others screens
+their contact, so $A_{ij} = 0$. `elasticrab` builds it once, in process
+([voronota-ltr](https://github.com/mlund/voronota-ltr)), and uses it two ways — for
+springs (`--voronota`) and for scoring (`--voromqa`).
+
+**`--voronota` — area-weighted springs.** The default cutoff network springs every
+pair within `--cutoff` with equal stiffness. `--voronota` instead springs each
+contacting pair, with a per-edge weight set by its contact area:
+
+$$w_{ij} = \frac{A_{ij}}{\bar A}, \qquad \bar A = \frac{1}{N_c} \sum_{(i,j)} A_{ij}$$
+
+($w_{ij} = 1$ for the cutoff network; $N_c$ is the number of contacts). A larger
+shared face is a stiffer spring, and normalizing to unit mean keeps the average
+weight at 1, so `--gamma` keeps its meaning. The harmonic energy of a conformation is
+
+$$E_\text{spring} = \tfrac12\,\gamma \sum_{(i,j)} w_{ij}\,\bigl(\lvert \mathbf{r}_{ij} \rvert - d^0_{ij}\bigr)^2,$$
+
+with $\mathbf{r}_{ij} = \mathbf{r}_j - \mathbf{r}_i$ and $d^0_{ij}$ the native
+separation (so the native structure has $E_\text{spring} = 0$). The two networks feed
+the same Hessian and energy; only the pair set and the weights $w_{ij}$ differ, so
+their absolute frequencies are not directly comparable. `--voronota` is mutually
+exclusive with `--cutoff`.
+
+**`--voromqa` — knowledge-based scoring.** `--voromqa` scores each `--energy` frame
+with the [VoroMQA](https://github.com/kliment-olechnovic/voronota) contact-area
+potential (bundled v1), Boltzmann-inverted from the PDB, in place of the spring
+energy:
+
+$$E_\text{VoroMQA} = \sum_{(i,j)} A_{ij}\,e(t_i, t_j, c_{ij}) \;+\; \sum_a S_a\,e(t_a, \text{solvent}).$$
+
+Here $t_a$ is atom $a$'s type, $e(\cdot)$ a tabulated energy per unit area, $S_a$ the
+solvent-accessible area of atom $a$ (its one-body burial term), and $c_{ij}$ the
+contact class — centrality (a buried, face-on contact vs. a peripheral one) crossed
+with sequence separation (adjacent residues vs. farther): `central_sep1`,
+`central_sep2`, `sep1`, or `sep2`. The harmonic NMA still generates the frames; only
+the per-frame score changes, re-tessellated each frame. Because $E_\text{VoroMQA}$ is
+area-based (Å²) like the spring energy, `--gamma` (kJ/mol/Å²) scales it to
+`energy_kJ_mol` and `weight` exactly as above — a tuning knob, since γ's
+B-factor-fitted default suits the springs. `--voromqa-file <path>` supplies a
+different potential; `--voromqa` and `--voromqa-file` are mutually exclusive and both
+require `--energy`.
 
 ## Benchmarks
 
