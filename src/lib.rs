@@ -66,7 +66,7 @@ pub struct Atom {
 /// separately, in the `Springs` value the builder constructs).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Params {
-    /// Uniform spring constant `γ₀`; the effective force constant of edge `ij` is
+    /// Uniform spring constant `γ₀`; the effective spring constant of edge `ij` is
     /// `gamma · weight`. It scales every eigenvalue, so it sets only the overall
     /// scale, not the mode shapes or eigenvalue ratios.
     pub gamma: f64,
@@ -142,7 +142,7 @@ impl std::error::Error for Error {}
 /// One spring of an explicit elastic network: two atoms (by index into the
 /// `atoms` slice) and a relative stiffness `weight`. Pass these to
 /// [`Builder::springs`] — e.g. Voronoi contacts weighted by area. The effective
-/// force constant is `gamma · weight`, and the rest length is the atoms'
+/// spring constant is `gamma · weight`, and the rest length is the atoms'
 /// equilibrium separation, so only the connectivity and weight are given here.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Spring {
@@ -150,7 +150,7 @@ pub struct Spring {
     pub i: usize,
     /// Index of the second atom, into the `atoms` slice.
     pub j: usize,
-    /// Relative stiffness; the force constant is `gamma · weight`.
+    /// Relative stiffness; the spring constant is `gamma · weight`.
     pub weight: f64,
 }
 
@@ -206,10 +206,11 @@ struct Rtb {
 /// tiny positive *and negative* values a finite-precision solver returns.
 const ZERO_EIGENVALUE: f64 = 1e-6;
 
-/// Boltzmann constant in kJ·mol⁻¹·K⁻¹, matching a `gamma` expressed in
-/// kJ·mol⁻¹·Å⁻². The absolute scale of amplitudes and fluctuations is only
-/// meaningful relative to `gamma`, so callers commonly rescale regardless.
-const BOLTZMANN_KJ_PER_MOL_K: f64 = 8.314_462_618e-3;
+/// Molar gas constant R = N_A·k_B, in kJ·mol⁻¹·K⁻¹, matching a `gamma` expressed in
+/// kJ·mol⁻¹·Å⁻²: energies are per-mole, so amplitudes and fluctuations use RT, not
+/// the per-particle kT. Their absolute scale is only meaningful relative to `gamma`,
+/// so callers commonly rescale regardless.
+const GAS_CONSTANT_KJ_PER_MOL_K: f64 = 8.314_462_618e-3;
 
 /// Below this angular speed a block's nonlinear motion is treated as a pure
 /// translation, which also guards the rotation-axis normalization against a
@@ -723,12 +724,12 @@ impl NormalModes {
     /// The absolute scale is arbitrary in an ANM (it rides on `gamma`); the
     /// useful information is the *relative* amplitude across modes.
     pub fn thermal_amplitudes(&self, temperature_k: f64) -> Vec<f64> {
-        let two_kt = 2.0 * BOLTZMANN_KJ_PER_MOL_K * temperature_k;
+        let two_rt = 2.0 * GAS_CONSTANT_KJ_PER_MOL_K * temperature_k;
         self.eigenvalues
             .iter()
             .map(|&lambda| {
                 if lambda > ZERO_EIGENVALUE {
-                    (two_kt / lambda).sqrt()
+                    (two_rt / lambda).sqrt()
                 } else {
                     0.0
                 }
@@ -736,9 +737,10 @@ impl NormalModes {
             .collect()
     }
 
-    /// Predicted thermal fluctuation `⟨Δrₐ²⟩ = k_BT Σᵢ (1/λᵢ) |vᵢ(a)|²` of each
+    /// Predicted thermal fluctuation `⟨Δrₐ²⟩ = RT Σᵢ (1/λᵢ) |vᵢ(a)|²` of each
     /// atom at temperature `T` (kelvin), summed over the non-zero modes — the
-    /// quantity behind crystallographic B-factors, `B = (8π²/3)⟨Δr²⟩`.
+    /// quantity behind crystallographic B-factors, `B = (8π²/3)⟨Δr²⟩`. (`RT`, not
+    /// `kT`: the energies are molar, matching γ in kJ/mol/Å².)
     ///
     /// These are *configurational* fluctuations: independent of mass, so for
     /// physical B-factors build the modes **without** mass-weighting
@@ -746,13 +748,13 @@ impl NormalModes {
     /// atom; a disconnected atom (zero in every mode) scores 0. With γ in
     /// kJ/mol/Å² the values are in Å².
     pub fn fluctuations(&self, temperature_k: f64) -> Vec<f64> {
-        let kt = BOLTZMANN_KJ_PER_MOL_K * temperature_k;
+        let rt = GAS_CONSTANT_KJ_PER_MOL_K * temperature_k;
         let mut msf = vec![0.0; self.n_atoms];
         for (i, &lambda) in self.eigenvalues.iter().enumerate() {
             if lambda <= ZERO_EIGENVALUE {
                 continue;
             }
-            let weight = kt / lambda;
+            let weight = rt / lambda;
             for (out, v) in msf.iter_mut().zip(self.eigenvector(i)) {
                 *out += weight * (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
             }
@@ -776,7 +778,7 @@ impl NormalModes {
     /// Elastic-network energy of a conformation: `½γ Σ (|r_ij| − r⁰_ij)²` over the
     /// springs, in the energy units of `gamma` (kJ/mol when γ is in kJ/mol/Å²).
     ///
-    /// This is the potential whose Boltzmann factor `exp(−E / k_B T)` weights a
+    /// This is the potential whose Boltzmann factor `exp(−E / RT)` weights a
     /// conformation — the quantity to reweight Monte-Carlo moves between
     /// structures sampled from [`displace`](Self::displace) /
     /// [`displace_nonlinear`](Self::displace_nonlinear). It depends only on the
@@ -847,7 +849,7 @@ impl<'a> Builder<'a> {
         self
     }
 
-    /// Global spring constant `γ₀` (default `1.0`); the force constant of edge `ij`
+    /// Global spring constant `γ₀` (default `1.0`); the spring constant of edge `ij`
     /// is `γ₀ · weight`. It scales every eigenvalue, setting only the overall scale.
     #[must_use]
     pub const fn gamma(mut self, gamma: f64) -> Self {

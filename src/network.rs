@@ -8,7 +8,7 @@ use std::collections::HashMap;
 /// A spring between two atoms, carrying the data the Hessian assembly needs so
 /// it never has to revisit the coordinates: the endpoint indices, the
 /// displacement `j - i`, its squared length, and a relative stiffness `weight`
-/// (the effective force constant is `gamma · weight`; the cutoff path uses 1.0).
+/// (the effective spring constant is `gamma · weight`; the cutoff path uses 1.0).
 pub(crate) struct Contact {
     pub i: usize,
     pub j: usize,

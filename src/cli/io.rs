@@ -19,15 +19,13 @@ pub struct EnergyRow {
     /// 1-based mode index; `0` marks the native (input) frame.
     pub mode: usize,
     pub rmsd: f64,
-    /// Geometric spring energy at γ=1, in Å².
+    /// The active scheme's energy (elastic spring, or VoroMQA with `--voromqa`)
+    /// *relative to the native structure*, at γ=1, in Å². Native frame = 0.
     pub energy: f64,
     /// Real energy `γ·energy`, in kJ/mol.
     pub energy_kj: f64,
-    /// Boltzmann weight `exp(−energy_kj / kT)` (native = 1).
+    /// Boltzmann weight `exp(−energy_kj / RT)` (native = 1).
     pub weight: f64,
-    /// VoroMQA contact-area pseudo-energy of the frame, when `--voromqa` is set;
-    /// `None` otherwise (the column is then omitted entirely).
-    pub voromqa: Option<f64>,
 }
 
 /// Standard atomic weights for the common protein elements; a neutral fallback
@@ -52,25 +50,16 @@ fn writing(path: &Path, e: &std::io::Error) -> String {
 pub fn write_csv(path: &Path, rows: &[EnergyRow]) -> Result<(), String> {
     let file = File::create(path).map_err(|e| writing(path, &e))?;
     let mut writer = BufWriter::new(file);
-    // The `voromqa_energy` column is present only when scored (all rows agree).
-    let with_voromqa = rows.first().is_some_and(|r| r.voromqa.is_some());
-    let header: &[u8] = if with_voromqa {
-        b"frame,mode,rmsd,energy,energy_kJ_mol,weight,voromqa_energy\n"
-    } else {
-        b"frame,mode,rmsd,energy,energy_kJ_mol,weight\n"
-    };
-    writer.write_all(header).map_err(|e| writing(path, &e))?;
+    writer
+        .write_all(b"frame,mode,rmsd,energy,energy_kJ_mol,weight\n")
+        .map_err(|e| writing(path, &e))?;
     for r in rows {
-        write!(
+        writeln!(
             writer,
             "{},{},{:.6},{:.6},{:.6},{:.6e}",
             r.frame, r.mode, r.rmsd, r.energy, r.energy_kj, r.weight
         )
         .map_err(|e| writing(path, &e))?;
-        if let Some(v) = r.voromqa {
-            write!(writer, ",{v:.6}").map_err(|e| writing(path, &e))?;
-        }
-        writeln!(writer).map_err(|e| writing(path, &e))?;
     }
     writer.flush().map_err(|e| writing(path, &e))
 }

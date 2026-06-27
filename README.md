@@ -112,7 +112,7 @@ elasticrab protein.pdb --select "chain A" --json out.json # restrict atoms; stru
 elasticrab protein.pdb -n 5 -o pool.xtc --energy e.csv    # merge modes + per-frame energies
 elasticrab protein.pdb --b-factor-fit --frames 0          # fit gamma to the input's B-factors
 elasticrab protein.pdb --voronota -o mode1.pdb            # area-weighted Voronoi springs, not a cutoff
-elasticrab protein.pdb -n 5 -o p.xtc --energy e.csv --voromqa  # + a VoroMQA score column
+elasticrab protein.pdb -n 5 -o p.xtc --energy e.csv --voromqa  # VoroMQA energy, not spring
 ```
 
 It prints a frequency report to stdout (`--json` writes it to a file); run
@@ -133,9 +133,10 @@ into one trajectory (the native structure first) and writes a
 own **thermal amplitude** — swept over ±`--sigmas` σ (default 3) of its thermal
 fluctuation, sized from γ and the temperature — so the frames are Boltzmann-
 relevant rather than the much larger visualization `--amplitude`. `energy` is the
-geometric spring energy (γ=1, Å²), `energy_kJ_mol` applies the spring constant
-`--gamma` (kJ/mol/Å²), and `weight` is `exp(−energy_kJ_mol / k_B T)` at
-`--temperature` (298.15 K), with the native frame at weight 1. The energy is
+geometric spring energy relative to the native (γ=1, Å²), `energy_kJ_mol` applies
+the spring constant `--gamma` (kJ/mol/Å²), and `weight` is `exp(−energy_kJ_mol / RT)`
+at `--temperature` (298.15 K) — `RT`, since the energy is molar — with the native
+frame at weight 1. The energy is
 comparable across modes since it depends only on the coordinates. `frame` is the
 0-based index in trajectory order (a multi-model PDB labels it `MODEL frame+1`).
 
@@ -147,14 +148,15 @@ a B-factor-fitted median over a small PDB set (`scripts/calibrate-gamma.sh`);
 since the fit is noisy across structures, pass `--b-factor-fit` for quantitative
 work.
 
-`--voromqa` adds a `voromqa_energy` column to the `--energy` table: a knowledge-based
-[VoroMQA](https://github.com/kliment-olechnovic/voronota) contact-area score
-(bundled v1 potential), re-tessellated per frame, as an empirical alternative to the
-spring energy for reweighting. It is a pseudo-energy in **arbitrary units** (an
-area-weighted log-odds, not kJ/mol): meaningful only as differences between
-conformations, with one free temperature scale for the weights. `--voromqa-file
-<path>` uses a potential you supply instead (e.g. another revision); the two are
-mutually exclusive.
+`--voromqa` makes the `--energy` table use a knowledge-based
+[VoroMQA](https://github.com/kliment-olechnovic/voronota) contact-area energy
+(bundled v1 potential), re-tessellated per frame, **in place of** the spring energy —
+a more physical empirical energy for reweighting. The `energy` column is referenced
+to the native frame (native = 0), and `--gamma` scales it into `energy_kJ_mol` and
+`weight` exactly as for the spring: both energies are area-based (Å²), so γ is a
+tuning knob with the right units (kJ/mol/Å²). Its B-factor-fitted default suits the
+spring; tune it for VoroMQA. `--voromqa-file <path>` supplies a different potential;
+the two are mutually exclusive, and both require `--energy`.
 
 ## Benchmarks
 

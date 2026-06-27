@@ -22,8 +22,9 @@ use voronota_ltr::{compute_contacts_only, Ball};
 /// structures, so for quantitative work pass `--b-factor-fit` or your own `--gamma`.
 const DEFAULT_GAMMA: f64 = 11.5;
 
-/// Boltzmann constant in kJ·mol⁻¹·K⁻¹, matching γ in kJ/mol/Å².
-const BOLTZMANN_KJ_PER_MOL_K: f64 = 8.314_462_618e-3;
+/// Molar gas constant R = N_A·k_B, in kJ·mol⁻¹·K⁻¹. Energies here are per-mole
+/// (kJ/mol, via γ), so the Boltzmann factor uses RT, not the per-particle kT.
+const GAS_CONSTANT_KJ_PER_MOL_K: f64 = 8.314_462_618e-3;
 
 /// Normal-mode analysis: animate a protein's softest vibrational modes.
 ///
@@ -99,12 +100,13 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     energy: Option<PathBuf>,
 
-    /// Add a VoroMQA contact-area energy column to the --energy table.
+    /// Use the VoroMQA contact-area energy for the --energy table, in place of the
+    /// elastic spring energy.
     ///
-    /// A knowledge-based pseudo-energy (bundled v1 potential), re-tessellated per
-    /// frame — an empirical alternative to the spring energy for MC reweighting.
-    /// Arbitrary units (area-weighted log-odds, not kJ/mol): meaningful only as
-    /// differences, with one free temperature scale for the weights.
+    /// A knowledge-based score (bundled v1 potential), re-tessellated per frame. The
+    /// energy column is referenced to the native frame and scaled by --gamma (a
+    /// tuning knob with the right units — tune it for VoroMQA), so energy_kJ_mol and
+    /// weight follow exactly as for the spring energy.
     #[arg(long, requires = "energy")]
     voromqa: bool,
 
@@ -118,9 +120,12 @@ struct Cli {
     )]
     voromqa_file: Option<PathBuf>,
 
-    /// Spring constant γ (kJ/mol/Å²).
+    /// Energy scale γ (kJ/mol/Å²) — the spring constant and the --energy table's
+    /// shared scale.
     ///
-    /// Scales the energy and weight columns; the default is B-factor-calibrated.
+    /// Scales the energy_kJ_mol/weight columns for whichever scheme is active
+    /// (elastic, or VoroMQA with --voromqa). The default is B-factor-fitted for the
+    /// spring; tune it for VoroMQA.
     #[arg(short = 'g', long, default_value_t = DEFAULT_GAMMA, value_name = "VALUE")]
     gamma: f64,
 
@@ -140,7 +145,7 @@ struct Cli {
     /// Thermal sampling width for --energy, in σ.
     ///
     /// Each mode is swept over ±N·σ of its own thermal fluctuation, so the pool
-    /// is Boltzmann-relevant (peak energy ≈ ½N²·kT).
+    /// is Boltzmann-relevant (peak energy ≈ ½N²·RT).
     #[arg(long, default_value_t = 3.0, value_name = "N")]
     sigmas: f64,
 }
@@ -305,18 +310,37 @@ fn write_merged(
         ));
     }
 
-    // Atom types are fixed across frames; compute them once for the scorer. Re-
-    // tessellate and score a frame when --voromqa is in effect.
+    // Atom types are fixed across frames; compute them once for the scorer.
     let types = voromqa.map(|_| voromqa::atom_types(records));
-    let score_frame = |frame: &[[f64; 3]]| match (voromqa, &types) {
-        (Some(p), Some(t)) => Some(p.score(frame, t, records, radii)),
-        _ => None,
+
+    // The energy scheme: VoroMQA (when set) or the elastic spring energy. Both are
+    // referenced to the native frame so the `energy` column starts at 0.
+    let frame_energy = |frame: &[[f64; 3]]| match (voromqa, &types) {
+        (Some(p), Some(t)) => p.score(frame, t, records, radii).energy,
+        _ => modes.energy(frame),
+    };
+    // Native energy, scored once; for VoroMQA, surface any coverage gap here (the
+    // same atoms every frame).
+    let native_energy = match (voromqa, &types) {
+        (Some(p), Some(t)) => {
+            let s = p.score(positions, t, records, radii);
+            if s.skipped > 0 {
+                eprintln!(
+                    "warning: VoroMQA has no parameters for {}/{} atoms (skipped from the score)",
+                    s.skipped, s.total
+                );
+            }
+            s.energy
+        }
+        _ => modes.energy(positions),
     };
 
-    // Build a row, deriving the real energy (γ·E_geometric) and Boltzmann weight
-    // (native E=0 ⇒ weight 1, the maximum) from the geometric γ=1 energy.
-    let kt = BOLTZMANN_KJ_PER_MOL_K * cli.temperature;
-    let row = |frame, mode, rmsd, energy: f64, voromqa_energy: Option<f64>| {
+    // A row: real energy γ·E and weight exp(−γ·E / RT), where E is the frame's
+    // energy relative to the native (native ⇒ 0 ⇒ weight 1). γ is the shared scale
+    // (a tuning knob with the right units) for whichever scheme is active; RT (not
+    // kT) because E is molar.
+    let rt = GAS_CONSTANT_KJ_PER_MOL_K * cli.temperature;
+    let row = |frame, mode, rmsd, energy: f64| {
         let energy_kj = gamma * energy;
         io::EnergyRow {
             frame,
@@ -324,41 +348,21 @@ fn write_merged(
             rmsd,
             energy,
             energy_kj,
-            weight: (-energy_kj / kt).exp(),
-            voromqa: voromqa_energy,
+            weight: (-energy_kj / rt).exp(),
         }
     };
 
-    // Frame 0 is the native structure — the energy zero and the MC rest state.
-    // Score it once: its coverage gap (the same atoms every frame) drives the
-    // warning, and its energy is row 0.
-    let native_voromqa = score_frame(positions);
-    if let Some(s) = &native_voromqa {
-        if s.skipped > 0 {
-            eprintln!(
-                "warning: VoroMQA has no parameters for {}/{} atoms (skipped from the score)",
-                s.skipped, s.total
-            );
-        }
-    }
+    // Frame 0 is the native structure — the MC rest state, at energy 0.
     let mut frames = vec![positions.to_vec()];
-    let mut rows = vec![row(
-        0,
-        0,
-        0.0,
-        modes.energy(positions),
-        native_voromqa.map(|s| s.energy),
-    )];
+    let mut rows = vec![row(0, 0, 0.0, 0.0)];
     for &m in wanted {
         for frame in thermal_frames(modes, positions, m, gamma, cli)? {
-            let energy = modes.energy(&frame);
-            let voromqa_energy = score_frame(&frame).map(|s| s.energy);
+            let energy = frame_energy(&frame) - native_energy;
             rows.push(row(
                 frames.len(),
                 m,
                 rms_deviation(&frame, positions),
                 energy,
-                voromqa_energy,
             ));
             frames.push(frame);
         }
@@ -366,7 +370,16 @@ fn write_merged(
 
     write_trajectory(&traj, records, &frames)?;
     io::write_csv(csv, &rows)?;
-    println!("  wrote {} and {}", traj.display(), csv.display());
+    let scheme = if voromqa.is_some() {
+        "VoroMQA"
+    } else {
+        "elastic"
+    };
+    println!(
+        "  wrote {} and {} ({scheme} energy)",
+        traj.display(),
+        csv.display()
+    );
     Ok(())
 }
 
@@ -590,8 +603,8 @@ fn thermal_frames(
             "mode {mode} has no restoring energy to sample thermally"
         ));
     }
-    let kt = BOLTZMANN_KJ_PER_MOL_K * cli.temperature;
-    let peak = cli.sigmas * (kt / (2.0 * gamma * unit_energy)).sqrt();
+    let rt = GAS_CONSTANT_KJ_PER_MOL_K * cli.temperature;
+    let peak = cli.sigmas * (rt / (2.0 * gamma * unit_energy)).sqrt();
     sweep(modes, positions, mode, peak, cli.frames, cli.linear)
 }
 
