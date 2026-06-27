@@ -3,6 +3,7 @@
 //! NOLB but with idiomatic names and 1-indexed (rigid-body-free) modes.
 
 mod io;
+mod voromqa;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -98,6 +99,25 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     energy: Option<PathBuf>,
 
+    /// Add a VoroMQA contact-area energy column to the --energy table.
+    ///
+    /// A knowledge-based pseudo-energy (bundled v1 potential), re-tessellated per
+    /// frame — an empirical alternative to the spring energy for MC reweighting.
+    /// Arbitrary units (area-weighted log-odds, not kJ/mol): meaningful only as
+    /// differences, with one free temperature scale for the weights.
+    #[arg(long, requires = "energy")]
+    voromqa: bool,
+
+    /// Like --voromqa, but with a potential file you supply (e.g. another VoroMQA
+    /// revision). Mutually exclusive with --voromqa.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with = "voromqa",
+        requires = "energy"
+    )]
+    voromqa_file: Option<PathBuf>,
+
     /// Spring constant γ (kJ/mol/Å²).
     ///
     /// Scales the energy and weight columns; the default is B-factor-calibrated.
@@ -191,6 +211,14 @@ fn execute(cli: &Cli) -> Result<(), String> {
         .then(|| voronota_springs(&records, &radii))
         .transpose()?;
 
+    // Optional VoroMQA scorer for the --energy table (bundled v1, or a given file),
+    // built before the solve so a malformed --voromqa-file fails fast.
+    let voromqa = match (cli.voromqa, &cli.voromqa_file) {
+        (true, _) => Some(voromqa::Potential::bundled()),
+        (false, Some(path)) => Some(voromqa::Potential::load(path)?),
+        (false, None) => None,
+    };
+
     let wanted = wanted_modes(cli)?;
     let k = *wanted.iter().max().expect("wanted is non-empty");
 
@@ -217,7 +245,17 @@ fn execute(cli: &Cli) -> Result<(), String> {
     report(cli, &records, &blocks, &modes, gamma, fit_r)?;
 
     if let Some(csv) = cli.energy.as_deref() {
-        write_merged(cli, &modes, &positions, &records, &wanted, csv, gamma)?;
+        write_merged(
+            cli,
+            &modes,
+            &positions,
+            &records,
+            &wanted,
+            csv,
+            gamma,
+            voromqa.as_ref(),
+            &radii,
+        )?;
     } else if cli.frames > 0 {
         let multi = wanted.len() > 1;
         for &m in &wanted {
@@ -235,6 +273,9 @@ fn execute(cli: &Cli) -> Result<(), String> {
 /// trajectory and write the matching per-frame energy table. The energies are
 /// the elastic-network spring energy of each frame (native = 0), comparable
 /// across modes because the energy depends only on the coordinates.
+// A CLI orchestration sink; the inputs are all distinct and `radii` is shared
+// rather than rebuilt, so a context struct would obscure more than it tidies.
+#[allow(clippy::too_many_arguments)]
 fn write_merged(
     cli: &Cli,
     modes: &NormalModes,
@@ -243,6 +284,8 @@ fn write_merged(
     wanted: &[usize],
     csv: &Path,
     gamma: f64,
+    voromqa: Option<&voromqa::Potential>,
+    radii: &RadiiLookup,
 ) -> Result<(), String> {
     if cli.frames == 0 {
         return Err("--energy needs --frames greater than 0 (nothing to score otherwise)".into());
@@ -262,10 +305,18 @@ fn write_merged(
         ));
     }
 
+    // Atom types are fixed across frames; compute them once for the scorer. Re-
+    // tessellate and score a frame when --voromqa is in effect.
+    let types = voromqa.map(|_| voromqa::atom_types(records));
+    let score_frame = |frame: &[[f64; 3]]| match (voromqa, &types) {
+        (Some(p), Some(t)) => Some(p.score(frame, t, records, radii)),
+        _ => None,
+    };
+
     // Build a row, deriving the real energy (γ·E_geometric) and Boltzmann weight
     // (native E=0 ⇒ weight 1, the maximum) from the geometric γ=1 energy.
     let kt = BOLTZMANN_KJ_PER_MOL_K * cli.temperature;
-    let row = |frame, mode, rmsd, energy: f64| {
+    let row = |frame, mode, rmsd, energy: f64, voromqa_energy: Option<f64>| {
         let energy_kj = gamma * energy;
         io::EnergyRow {
             frame,
@@ -274,20 +325,40 @@ fn write_merged(
             energy,
             energy_kj,
             weight: (-energy_kj / kt).exp(),
+            voromqa: voromqa_energy,
         }
     };
 
     // Frame 0 is the native structure — the energy zero and the MC rest state.
+    // Score it once: its coverage gap (the same atoms every frame) drives the
+    // warning, and its energy is row 0.
+    let native_voromqa = score_frame(positions);
+    if let Some(s) = &native_voromqa {
+        if s.skipped > 0 {
+            eprintln!(
+                "warning: VoroMQA has no parameters for {}/{} atoms (skipped from the score)",
+                s.skipped, s.total
+            );
+        }
+    }
     let mut frames = vec![positions.to_vec()];
-    let mut rows = vec![row(0, 0, 0.0, modes.energy(positions))];
+    let mut rows = vec![row(
+        0,
+        0,
+        0.0,
+        modes.energy(positions),
+        native_voromqa.map(|s| s.energy),
+    )];
     for &m in wanted {
         for frame in thermal_frames(modes, positions, m, gamma, cli)? {
             let energy = modes.energy(&frame);
+            let voromqa_energy = score_frame(&frame).map(|s| s.energy);
             rows.push(row(
                 frames.len(),
                 m,
                 rms_deviation(&frame, positions),
                 energy,
+                voromqa_energy,
             ));
             frames.push(frame);
         }
@@ -744,5 +815,28 @@ mod tests {
             assert!(s.i < n && s.j < n && s.i != s.j, "bad endpoints: {s:?}");
             assert!(s.weight.is_finite() && s.weight > 0.0, "bad weight: {s:?}");
         }
+    }
+
+    /// The bundled VoroMQA potential covers every atom of a standard protein (the
+    /// `generalize` step maps symmetric/terminal atoms to trained types) and yields
+    /// a finite energy.
+    #[test]
+    fn voromqa_scores_crambin_fully() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/crambin_heavy.pdb");
+        let options = ParseOptions {
+            exclude_heteroatoms: true,
+            ..Default::default()
+        };
+        let radii = RadiiLookup::new();
+        let records = parse_file_with_records(Path::new(path), &options, &radii)
+            .unwrap()
+            .records;
+        let positions: Vec<[f64; 3]> = records.iter().map(|r| [r.x, r.y, r.z]).collect();
+
+        let types = voromqa::atom_types(&records);
+        let score = voromqa::Potential::bundled().score(&positions, &types, &records, &radii);
+        assert_eq!(score.skipped, 0, "v1 should cover every crambin atom");
+        assert_eq!(score.total, records.len());
+        assert!(score.energy.is_finite() && score.energy != 0.0);
     }
 }

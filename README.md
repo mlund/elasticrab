@@ -112,6 +112,7 @@ elasticrab protein.pdb --select "chain A" --json out.json # restrict atoms; stru
 elasticrab protein.pdb -n 5 -o pool.xtc --energy e.csv    # merge modes + per-frame energies
 elasticrab protein.pdb --b-factor-fit --frames 0          # fit gamma to the input's B-factors
 elasticrab protein.pdb --voronota -o mode1.pdb            # area-weighted Voronoi springs, not a cutoff
+elasticrab protein.pdb -n 5 -o p.xtc --energy e.csv --voromqa  # + a VoroMQA score column
 ```
 
 It prints a frequency report to stdout (`--json` writes it to a file); run
@@ -145,6 +146,15 @@ to it if the fit fails). The default γ is
 a B-factor-fitted median over a small PDB set (`scripts/calibrate-gamma.sh`);
 since the fit is noisy across structures, pass `--b-factor-fit` for quantitative
 work.
+
+`--voromqa` adds a `voromqa_energy` column to the `--energy` table: a knowledge-based
+[VoroMQA](https://github.com/kliment-olechnovic/voronota) contact-area score
+(bundled v1 potential), re-tessellated per frame, as an empirical alternative to the
+spring energy for reweighting. It is a pseudo-energy in **arbitrary units** (an
+area-weighted log-odds, not kJ/mol): meaningful only as differences between
+conformations, with one free temperature scale for the weights. `--voromqa-file
+<path>` uses a potential you supply instead (e.g. another revision); the two are
+mutually exclusive.
 
 ## Benchmarks
 

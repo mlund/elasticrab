@@ -38,5 +38,16 @@ ProDy is distributed under the MIT License:
 >
 > THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
 
+## Bundled VoroMQA potential
+
+`src/cli/voromqa_v1_potential.txt` is the **VoroMQA v1** atom-level contact-area
+energy potential (Olechnovic & Venclovas), vendored byte-for-byte from Voronota's
+`resources/voromqa_v1_energy_potential` (https://github.com/kliment-olechnovic/voronota).
+It is embedded into the `cli` binary (`--voromqa`) as an empirical scoring function.
+Voronota is distributed under the MIT License (Copyright © 2013–2023 Kliment
+Olechnovic), with the same terms as quoted above.
+
+## License
+
 The `elasticrab` crate itself is licensed under Apache-2.0; bundling these
-MIT-licensed fixtures is compatible with that license.
+MIT-licensed fixtures and data is compatible with that license.
