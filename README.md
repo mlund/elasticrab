@@ -188,15 +188,28 @@ E_\text{VoroMQA} = \sum_{(i,j)} A_{ij}\, e(t_i, t_j, c_{ij}) + \sum_a S_a\, e(t_
 
 Here $`t_a`$ is atom $a$'s type, $`e(\cdot)`$ a tabulated energy per unit area, $`S_a`$
 the solvent-accessible area of atom $a$ (its one-body burial term), and $`c_{ij}`$ the
-contact class — centrality (a buried, face-on contact vs. a peripheral one) crossed
-with sequence separation (adjacent residues vs. farther): `central_sep1`,
-`central_sep2`, `sep1`, or `sep2`. The harmonic NMA still generates the frames; only
+contact class: centrality (a buried, face-on contact vs. a peripheral one) crossed
+with sequence separation. As in the reference, same-chain contacts at sequence
+separation ≤ 1 are excluded — their area is fixed by the covalent backbone — so every
+scored contact is `central_sep2` or `sep2`, and the `sep1` columns go unused. The
+harmonic NMA still generates the frames; only
 the per-frame score changes, re-tessellated each frame. Because $`E_\text{VoroMQA}`$
 is area-based (Å²) like the spring energy, `--gamma` (kJ/mol/Å²) scales it to
 `energy_kJ_mol` and `weight` exactly as above — a tuning knob, since γ's
 B-factor-fitted default suits the springs. `--voromqa-file <path>` supplies a
 different potential; `--voromqa` and `--voromqa-file` are mutually exclusive and both
 require `--energy`.
+
+**Relation to full Voronota.** elasticrab evaluates the score in-process with the
+lightweight [voronota-ltr](https://github.com/mlund/voronota-ltr) tessellation, not
+the full [Voronota](https://github.com/kliment-olechnovic/voronota) engine, so the
+absolute energy does not reproduce a `voronota-voromqa` run bit-for-bit: voronota-lt's
+contour-based centrality and contact areas differ slightly from Voronota's exact
+tessellation. On crambin the solvent term and total contact area agree to within
+0.5%, but the net energy — a small difference between two large terms of opposite sign
+(favourable contacts, unfavourable burial) — is more sensitive to it. This is a fixed
+scale offset, harmless for the native-referenced reweighting used here (it shifts
+every frame together), but worth knowing before comparing absolute scores.
 
 ## Benchmarks
 
