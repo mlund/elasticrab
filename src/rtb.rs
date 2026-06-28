@@ -9,9 +9,14 @@
 
 use std::collections::HashMap;
 
-use nalgebra::{DMatrix, Matrix3, Vector3};
+use nalgebra::{DMatrix, DVector, Matrix3, Rotation3, Unit, Vector3};
 
 use crate::Error;
+
+/// Below this angular speed a block's nonlinear motion is treated as a pure
+/// translation, which also guards the rotation-axis normalization against a
+/// near-zero vector.
+const ROTATION_EPS: f64 = 1e-12;
 
 /// Sparse projection entries `(row, col, value)` plus the column count `nb6`.
 pub(crate) type ProjectionEntries = (Vec<(usize, usize, f64)>, usize);
@@ -187,6 +192,51 @@ fn emit_block_columns(
             }
         }
     }
+}
+
+/// NOLB's nonlinear extrapolation: carry each block along the reduced
+/// `velocities` (an `nb6` vector of *amplitude-scaled* per-block linear and
+/// angular velocities — a single mode, or a combined sum of modes) as a rigid
+/// motion. The block rotates about its centre of mass and translates, so
+/// intra-block bond lengths are preserved at any amplitude. Atoms not in any
+/// block keep their position.
+///
+/// The reduced velocities are un-weighted to physical ones (NOLB eq. 1.11):
+/// `v = ṽ_w/√M_b`, `ω = I^{-1/2}·ω̃_w`; a single-atom block has no rotation. The
+/// amplitude is folded into `velocities`, so the rotation angle is `‖ω‖` directly.
+pub(crate) fn extrapolate(
+    blocks: &[BlockGeometry],
+    positions: &[[f64; 3]],
+    velocities: &DVector<f64>,
+) -> Vec<[f64; 3]> {
+    let mut out = positions.to_vec();
+    for block in blocks {
+        let col = block.col;
+        let velocity = Vector3::new(velocities[col], velocities[col + 1], velocities[col + 2]);
+        let translation = velocity / block.total_mass.sqrt();
+        // The rotation about the COM is the same for every atom, so build it once;
+        // a singleton (no `isqrt`) or a vanishing rotation leaves only translation.
+        let rotation = block.isqrt.and_then(|isqrt| {
+            let omega = isqrt
+                * Vector3::new(
+                    velocities[col + 3],
+                    velocities[col + 4],
+                    velocities[col + 5],
+                );
+            let speed = omega.norm();
+            (speed > ROTATION_EPS)
+                .then(|| Rotation3::from_axis_angle(&Unit::new_normalize(omega), speed))
+        });
+        for &atom in &block.atoms {
+            let position = Vector3::from(positions[atom]);
+            let moved = rotation.as_ref().map_or_else(
+                || position + translation,
+                |rotation| rotation * (position - block.com) + block.com + translation,
+            );
+            out[atom] = [moved.x, moved.y, moved.z];
+        }
+    }
+    out
 }
 
 /// Symmetric inverse square root `A·diag(1/√λ)·Aᵀ` of a positive-definite 3×3

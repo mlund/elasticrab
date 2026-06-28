@@ -42,6 +42,7 @@
     clippy::option_if_let_else
 )]
 
+mod align;
 mod eigen;
 mod hessian;
 mod network;
@@ -49,7 +50,7 @@ mod rtb;
 #[cfg(feature = "sparse")]
 mod sparse;
 
-use nalgebra::{DMatrix, Rotation3, Unit, Vector3};
+use nalgebra::{DMatrix, DVector};
 
 use network::Contact;
 use rtb::BlockGeometry;
@@ -124,6 +125,10 @@ pub enum Error {
     /// zero-length spring the Hessian's `1/d²` term cannot handle — usually a
     /// retained alternate-location or duplicate atom record.
     CoincidentAtoms,
+    /// [`NormalModes::transition`] was given a target whose atom count differs
+    /// from the modelled structure. The first cut requires the same atoms in the
+    /// same order; aligning differing structures is not yet supported.
+    AtomCountMismatch,
 }
 
 impl std::fmt::Display for Error {
@@ -138,6 +143,7 @@ impl std::fmt::Display for Error {
             Self::NoNetwork => write!(f, "no network: set a cutoff or springs"),
             Self::InvalidSpring => write!(f, "a spring references an invalid atom"),
             Self::CoincidentAtoms => write!(f, "two connected atoms share a position"),
+            Self::AtomCountMismatch => write!(f, "target atom count differs from the structure"),
         }
     }
 }
@@ -194,6 +200,14 @@ pub struct NormalModes {
     /// rebuilding the network.
     springs: Vec<Bond>,
     gamma: f64,
+    /// Whether the Hessian was mass-weighted, in which case the stored mode shapes
+    /// live in mass-weighted (`q = M^{1/2}r`) coordinates. [`transition`] needs
+    /// this to project and reconstruct in the right metric.
+    mass_weighted: bool,
+    /// Per *original* atom mass (disconnected atoms carry `1.0`, a harmless
+    /// placeholder since they are zero in every mode). Used only by
+    /// [`transition`] for the `√m` metric scale.
+    masses: Vec<f64>,
 }
 
 /// The data the nonlinear extrapolation needs beyond the per-atom mode shapes:
@@ -217,11 +231,6 @@ const ZERO_EIGENVALUE: f64 = 1e-6;
 /// the per-particle kT. Their absolute scale is only meaningful relative to `gamma`,
 /// so callers commonly rescale regardless.
 const GAS_CONSTANT_KJ_PER_MOL_K: f64 = 8.314_462_618e-3;
-
-/// Below this angular speed a block's nonlinear motion is treated as a pure
-/// translation, which also guards the rotation-axis normalization against a
-/// near-zero vector.
-const ROTATION_EPS: f64 = 1e-12;
 
 /// A spring shorter than this (squared, Å²) is treated as a zero-length spring
 /// between coincident atoms — `1e-6 Å²` is a 0.001 Å separation, far below any
@@ -420,12 +429,20 @@ impl NormalModes {
                 net,
                 n_original,
                 params.gamma,
+                params.mass_weighted,
             ),
             Some(k) => {
                 let columns = lowest_nonzero_columns(&spectrum.eigenvalues, k);
                 let eigenvalues = columns.iter().map(|&c| spectrum.eigenvalues[c]).collect();
                 let vectors = pick_columns(&spectrum.eigenvectors, &columns);
-                Self::from_modes(eigenvalues, &vectors, net, n_original, params.gamma)
+                Self::from_modes(
+                    eigenvalues,
+                    &vectors,
+                    net,
+                    n_original,
+                    params.gamma,
+                    params.mass_weighted,
+                )
             }
         })
     }
@@ -447,6 +464,7 @@ impl NormalModes {
             net,
             n_original,
             params.gamma,
+            params.mass_weighted,
         ))
     }
 
@@ -489,7 +507,14 @@ impl NormalModes {
         // Lift the reduced modes back with P, and keep them for nonlinear modes.
         let all_atom = &p * &reduced;
         let rtb = Self::build_rtb(net, &blocks, &weights, reduced)?;
-        let mut modes = Self::from_modes(eigenvalues, &all_atom, net, n_original, params.gamma);
+        let mut modes = Self::from_modes(
+            eigenvalues,
+            &all_atom,
+            net,
+            n_original,
+            params.gamma,
+            params.mass_weighted,
+        );
         modes.rtb = Some(rtb);
         Ok(modes)
     }
@@ -513,7 +538,14 @@ impl NormalModes {
             k,
         )?;
         let rtb = Self::build_rtb(net, blocks, weights, reduced)?;
-        let mut modes = Self::from_modes(eigenvalues, &vectors, net, n_original, params.gamma);
+        let mut modes = Self::from_modes(
+            eigenvalues,
+            &vectors,
+            net,
+            n_original,
+            params.gamma,
+            params.mass_weighted,
+        );
         modes.rtb = Some(rtb);
         Ok(modes)
     }
@@ -529,8 +561,13 @@ impl NormalModes {
         net: &Network,
         n_original: usize,
         gamma: f64,
+        mass_weighted: bool,
     ) -> Self {
         let mut modes = vec![[0.0; 3]; eigenvalues.len() * n_original];
+        let mut masses = vec![1.0; n_original];
+        for (p, &orig) in net.keep.iter().enumerate() {
+            masses[orig] = net.masses[p];
+        }
         for (m, col) in vectors.column_iter().enumerate() {
             let base = m * n_original;
             for (p, &orig) in net.keep.iter().enumerate() {
@@ -557,6 +594,8 @@ impl NormalModes {
             rtb: None,
             springs,
             gamma,
+            mass_weighted,
+            masses,
         }
     }
 
@@ -667,51 +706,222 @@ impl NormalModes {
         i: usize,
         amplitude: f64,
     ) -> Result<Vec<[f64; 3]>, Error> {
+        // A one-hot amplitude vector selects mode `i`; the combined path is the
+        // single home of the rigid-block kinematics. The `rtb`/range checks live
+        // there (an out-of-range `i` over-runs the amplitude length).
+        let mut amplitudes = vec![0.0; i + 1];
+        amplitudes[i] = amplitude;
+        self.displace_nonlinear_combined(positions, &amplitudes)
+    }
+
+    /// NOLB's nonlinear extrapolation driven by a *weighted sum* of modes,
+    /// `Σ amplitudes[i]·mode_i`: the per-block reduced velocities are combined
+    /// first and extrapolated once — not a sum of per-mode nonlinear
+    /// displacements, which would not compose into a single rigid motion. This is
+    /// the engine behind a [`Transition`]'s nonlinear morph. `amplitudes` may be
+    /// shorter than [`len`](Self::len); the remaining modes contribute zero.
+    fn displace_nonlinear_combined(
+        &self,
+        positions: &[[f64; 3]],
+        amplitudes: &[f64],
+    ) -> Result<Vec<[f64; 3]>, Error> {
+        let velocity = self.combined_reduced_velocity(amplitudes)?;
+        self.nonlinear_extrapolate(positions, &velocity)
+    }
+
+    /// Combine the per-block reduced velocities of `Σ amplitudes[i]·mode_i` into one
+    /// `nb6` vector (`reduced · a`). Kept separate from the extrapolation so a morph
+    /// can build it once and only rescale it per frame. `amplitudes` may be shorter
+    /// than [`len`](Self::len); the rest contribute zero.
+    fn combined_reduced_velocity(&self, amplitudes: &[f64]) -> Result<DVector<f64>, Error> {
         let rtb = self.rtb.as_ref().ok_or(Error::NotRigidBlocks)?;
-        assert!(i < self.len(), "mode index out of range");
+        assert!(amplitudes.len() <= self.len(), "too many amplitudes");
+        let mut a = DVector::zeros(self.len());
+        for (i, &amp) in amplitudes.iter().enumerate() {
+            a[i] = amp;
+        }
+        Ok(&rtb.reduced * a)
+    }
+
+    /// Apply a combined reduced velocity (from [`combined_reduced_velocity`]) to
+    /// `positions` as the rigid-block extrapolation.
+    fn nonlinear_extrapolate(
+        &self,
+        positions: &[[f64; 3]],
+        velocity: &DVector<f64>,
+    ) -> Result<Vec<[f64; 3]>, Error> {
+        let rtb = self.rtb.as_ref().ok_or(Error::NotRigidBlocks)?;
         assert_eq!(
             positions.len(),
             self.n_atoms,
             "positions must have one entry per atom"
         );
+        Ok(rtb::extrapolate(&rtb.blocks, positions, velocity))
+    }
 
+    /// The per-atom `√w` metric scale: `√mass` on the mass-weighted path,
+    /// otherwise `1`. The stored mode shapes are orthonormal in this metric, so a
+    /// [`transition`](Self::transition) projects and reconstructs through it.
+    fn metric_sqrt(&self) -> Vec<f64> {
+        if self.mass_weighted {
+            self.masses.iter().map(|m| m.sqrt()).collect()
+        } else {
+            vec![1.0; self.n_atoms]
+        }
+    }
+
+    /// The *physical* (Cartesian) displacement field of mode `i`: the stored mode
+    /// shape un-weighted by the metric — `eigenvector(i)/√mass` when the modes are
+    /// mass-weighted, otherwise [`eigenvector`](Self::eigenvector) unchanged.
+    ///
+    /// This is the column `∂x/∂aᵢ` of the linear amplitude→coordinates map
+    /// [`displace_by_amplitudes`](Self::displace_by_amplitudes): the Jacobian a
+    /// gradient-based fit (e.g. SAXS-guided refinement in a mode subspace) projects
+    /// its loss gradient onto. Disconnected atoms are zero.
+    ///
+    /// # Panics
+    /// If `i >= self.len()`.
+    pub fn mode_displacement(&self, i: usize) -> Vec<[f64; 3]> {
+        self.eigenvector(i)
+            .iter()
+            .zip(&self.metric_sqrt())
+            .map(|(v, &w)| [v[0] / w, v[1] / w, v[2] / w])
+            .collect()
+    }
+
+    /// Displace `positions` by a weighted sum of modes, `Σ amplitudes[i]·modeᵢ` — the
+    /// amplitude→coordinates map for low-dimensional conformational fitting (e.g.
+    /// SAXS-guided refinement over a handful of mode amplitudes).
+    ///
+    /// Linear (`nonlinear = false`) is `x + Σ amplitudes[i]·`
+    /// [`mode_displacement(i)`](Self::mode_displacement), whose Jacobian is constant
+    /// (the mode fields); `nonlinear` uses NOLB's rigid-block extrapolation
+    /// (bond-preserving) for a faithful final structure. `amplitudes` may be shorter
+    /// than [`len`](Self::len); the remaining modes contribute zero.
+    ///
+    /// # Errors
+    /// [`Error::NotRigidBlocks`] if `nonlinear` is set but the modes were built
+    /// without rigid blocks.
+    ///
+    /// # Panics
+    /// If `amplitudes.len() > self.len()`, or `positions.len()` is not the atom count.
+    pub fn displace_by_amplitudes(
+        &self,
+        positions: &[[f64; 3]],
+        amplitudes: &[f64],
+        nonlinear: bool,
+    ) -> Result<Vec<[f64; 3]>, Error> {
+        if nonlinear {
+            return self.displace_nonlinear_combined(positions, amplitudes);
+        }
+        assert!(amplitudes.len() <= self.len(), "too many amplitudes");
+        assert_eq!(
+            positions.len(),
+            self.n_atoms,
+            "positions must have one entry per atom"
+        );
+        let inv_sqrt_w: Vec<f64> = self.metric_sqrt().iter().map(|&w| 1.0 / w).collect();
         let mut out = positions.to_vec();
-        for block in &rtb.blocks {
-            // Un-weight the reduced velocities to physical ones (NOLB eq 1.11):
-            // v = ṽ_w/√M_b, ω = I^{-1/2}·ω̃_w. A singleton has no rotation.
-            let col = block.col;
-            let velocity = Vector3::new(
-                rtb.reduced[(col, i)],
-                rtb.reduced[(col + 1, i)],
-                rtb.reduced[(col + 2, i)],
-            );
-            let translation = amplitude * (velocity / block.total_mass.sqrt());
-            // The block's rotation about its COM by Δφ = a‖ω‖ about ω̂ is the same
-            // for every atom, so build it once; a singleton or vanishing rotation
-            // leaves only the translation.
-            let rotation = block.isqrt.and_then(|isqrt| {
-                let omega = isqrt
-                    * Vector3::new(
-                        rtb.reduced[(col + 3, i)],
-                        rtb.reduced[(col + 4, i)],
-                        rtb.reduced[(col + 5, i)],
-                    );
-                let speed = omega.norm();
-                (speed > ROTATION_EPS).then(|| {
-                    Rotation3::from_axis_angle(&Unit::new_normalize(omega), amplitude * speed)
-                })
-            });
-
-            for &atom in &block.atoms {
-                let position = Vector3::from(positions[atom]);
-                let moved = rotation.as_ref().map_or_else(
-                    || position + translation,
-                    |rotation| rotation * (position - block.com) + block.com + translation,
-                );
-                out[atom] = [moved.x, moved.y, moved.z];
-            }
+        for (i, &a) in amplitudes.iter().enumerate() {
+            accumulate(&mut out, self.eigenvector(i), a, &inv_sqrt_w);
         }
         Ok(out)
+    }
+
+    /// Best-fit *transition* from `native` (the modelled structure) toward a second
+    /// conformation `target`: the combination of modes that, applied to `native`,
+    /// most reduces the RMSD to `target` — NOLB's structure-to-structure transition.
+    ///
+    /// `target` is rigid-body superposed onto `native` (Kabsch), then its residual
+    /// deformation is projected onto the modes. The returned [`Transition`] reports
+    /// each mode's overlap with the native→target motion and generates the morph
+    /// trajectory ([`Transition::morph`]).
+    ///
+    /// Projection happens in the modes' own metric (mass-weighted when the modes
+    /// are), where they are orthonormal, so each coefficient is a plain dot product;
+    /// the reported RMSDs are always plain Cartesian (Å).
+    ///
+    /// # Errors
+    /// [`Error::AtomCountMismatch`] unless `native` and `target` each have one entry
+    /// per modelled atom, in the same order (aligning differing structures is not
+    /// yet supported).
+    pub fn transition<'a>(
+        &'a self,
+        native: &[[f64; 3]],
+        target: &[[f64; 3]],
+    ) -> Result<Transition<'a>, Error> {
+        if native.len() != self.n_atoms || target.len() != self.n_atoms {
+            return Err(Error::AtomCountMismatch);
+        }
+        // Remove the rigid-body component: superpose target onto native, so the
+        // remaining difference is pure internal deformation the modes can describe.
+        let aligned_target = align::superpose(native, target).apply(target);
+
+        // The difference in the modes' metric, dq = √w·(aligned − native). Zeroed at
+        // disconnected atoms: the modes are zero there, so that motion is not
+        // projectable and must not dilute the overlap normalization.
+        let sqrt_w = self.metric_sqrt();
+        let mut dq: Vec<[f64; 3]> = native
+            .iter()
+            .zip(&aligned_target)
+            .zip(&sqrt_w)
+            .map(|((n, t), &w)| [w * (t[0] - n[0]), w * (t[1] - n[1]), w * (t[2] - n[2])])
+            .collect();
+        for &d in &self.disconnected {
+            dq[d] = [0.0; 3];
+        }
+        let target_sq: f64 = dq
+            .iter()
+            .map(|d| d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+            .sum();
+        let scale = if target_sq > 0.0 {
+            1.0 / target_sq.sqrt()
+        } else {
+            0.0
+        };
+
+        // Project onto each (orthonormal) mode: aᵢ = vᵢ·dq.
+        let amplitudes: Vec<f64> = (0..self.len())
+            .map(|i| dot(self.eigenvector(i), &dq))
+            .collect();
+        let overlaps: Vec<f64> = amplitudes.iter().map(|&a| a * scale).collect();
+        let mut explained = 0.0;
+        let cumulative_overlap: Vec<f64> = amplitudes
+            .iter()
+            .map(|&a| {
+                explained += a * a;
+                explained.sqrt() * scale
+            })
+            .collect();
+        // An orthonormal projection cannot explain more than the target norm; a
+        // negative gap would mean the metric was applied inconsistently.
+        debug_assert!(
+            target_sq - explained >= -1e-6 * target_sq.max(1.0),
+            "projection exceeds the target norm — metric mismatch"
+        );
+
+        // Plain-RMSD residual after the lowest k modes, for k = 0..=len, built in one
+        // pass by accumulating the linear fit mode by mode (so the report is O(modes·
+        // atoms), not O(modes²·atoms)). The 1/√w un-weights a metric-space coefficient
+        // into a Cartesian displacement. `residuals[0]` is the initial RMSD.
+        let inv_sqrt_w: Vec<f64> = sqrt_w.iter().map(|&w| 1.0 / w).collect();
+        let mut fit = native.to_vec();
+        let mut residuals = Vec::with_capacity(self.len() + 1);
+        residuals.push(rmsd(&fit, &aligned_target));
+        for (i, &a) in amplitudes.iter().enumerate() {
+            accumulate(&mut fit, self.eigenvector(i), a, &inv_sqrt_w);
+            residuals.push(rmsd(&fit, &aligned_target));
+        }
+
+        Ok(Transition {
+            modes: self,
+            native: native.to_vec(),
+            aligned_target,
+            amplitudes,
+            overlaps,
+            cumulative_overlap,
+            residuals,
+        })
     }
 
     /// Original indices of atoms dropped from the analysis for being
@@ -903,6 +1113,122 @@ impl<'a> Builder<'a> {
             None => NormalModes::solve_all_atom(&net, &self.params, n),
         }
     }
+}
+
+/// The best-fit transition of a structure toward a target conformation, from
+/// [`NormalModes::transition`].
+///
+/// Reports how strongly each mode participates in the native→target motion, and
+/// generates the morph trajectory. Borrows the [`NormalModes`] it came from, for
+/// the mode shapes the morph needs.
+pub struct Transition<'a> {
+    modes: &'a NormalModes,
+    native: Vec<[f64; 3]>,
+    aligned_target: Vec<[f64; 3]>,
+    amplitudes: Vec<f64>,
+    overlaps: Vec<f64>,
+    cumulative_overlap: Vec<f64>,
+    /// Plain-RMSD residual after the lowest `k` modes, for `k = 0..=len` (length
+    /// `len + 1`); `residuals[0]` is the initial RMSD.
+    residuals: Vec<f64>,
+}
+
+impl Transition<'_> {
+    /// Each mode's overlap (cosine, in `[-1, 1]`) with the native→target motion.
+    pub fn overlaps(&self) -> &[f64] {
+        &self.overlaps
+    }
+
+    /// The running cumulative overlap: entry `k` is the fraction of the motion
+    /// captured by the lowest `k + 1` modes together, `√(Σ aᵢ²)/|Δ|`.
+    pub fn cumulative_overlap(&self) -> &[f64] {
+        &self.cumulative_overlap
+    }
+
+    /// Plain Cartesian RMSD (Å) between `native` and the rigid-body-aligned target —
+    /// the gap the modes try to close.
+    pub fn initial_rmsd(&self) -> f64 {
+        self.residuals[0]
+    }
+
+    /// Plain Cartesian RMSD (Å) the *linear* fit leaves after the lowest `k` modes
+    /// (`k` clamped to the available modes): `residual_rmsd(0)` is the initial RMSD,
+    /// `residual_rmsd(len)` the best this mode set achieves. The nonlinear morph's
+    /// endpoint differs slightly — see [`rmsd_to_target`](Self::rmsd_to_target).
+    pub fn residual_rmsd(&self, k: usize) -> f64 {
+        self.residuals[k.min(self.amplitudes.len())]
+    }
+
+    /// Plain Cartesian RMSD (Å) of an arbitrary structure to the aligned target — e.g.
+    /// the actual endpoint of a nonlinear [`morph`](Self::morph), which the linear
+    /// [`residual_rmsd`](Self::residual_rmsd) does not describe.
+    pub fn rmsd_to_target(&self, structure: &[[f64; 3]]) -> f64 {
+        rmsd(structure, &self.aligned_target)
+    }
+
+    /// The morph trajectory: `frames` frames from `native` (frame 0, when `frames > 1`)
+    /// to the best-fit approximation of the target (final frame); a single frame is the
+    /// endpoint. `nonlinear` uses NOLB's rigid-block extrapolation (bond-preserving);
+    /// otherwise the frames interpolate in a straight line along the fitted modes.
+    ///
+    /// # Errors
+    /// [`Error::NotRigidBlocks`] if `nonlinear` is set but the modes were built
+    /// without rigid blocks.
+    pub fn morph(&self, frames: usize, nonlinear: bool) -> Result<Vec<Vec<[f64; 3]>>, Error> {
+        // The nonlinear path's reduced velocity is linear in the amplitudes, so build
+        // it once and scale by t per frame rather than re-running the matvec.
+        let combined = nonlinear
+            .then(|| self.modes.combined_reduced_velocity(&self.amplitudes))
+            .transpose()?;
+        (0..frames)
+            .map(|f| {
+                let t = if frames > 1 {
+                    f as f64 / (frames - 1) as f64
+                } else {
+                    1.0
+                };
+                match &combined {
+                    Some(v) => self.modes.nonlinear_extrapolate(&self.native, &(v * t)),
+                    None => {
+                        // Straight-line frame: native + Σ (t·aᵢ)·modeᵢ, via the same
+                        // public map a fit would use.
+                        let scaled: Vec<f64> = self.amplitudes.iter().map(|a| a * t).collect();
+                        self.modes
+                            .displace_by_amplitudes(&self.native, &scaled, false)
+                    }
+                }
+            })
+            .collect()
+    }
+}
+
+/// Add `coeff · (mode / √w)` per atom to `out`, in place — one fitted mode's
+/// Cartesian contribution to a fit or morph, un-weighting the metric-space shape.
+fn accumulate(out: &mut [[f64; 3]], mode: &[[f64; 3]], coeff: f64, inv_sqrt_w: &[f64]) {
+    for ((o, v), &iw) in out.iter_mut().zip(mode).zip(inv_sqrt_w) {
+        let s = coeff * iw;
+        o[0] += s * v[0];
+        o[1] += s * v[1];
+        o[2] += s * v[2];
+    }
+}
+
+/// Sum of per-atom dot products of two equal-length per-atom vector fields.
+fn dot(a: &[[f64; 3]], b: &[[f64; 3]]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(p, q)| p[0] * q[0] + p[1] * q[1] + p[2] * q[2])
+        .sum()
+}
+
+/// Plain (un-superposed) Cartesian RMSD between two equal-length structures.
+fn rmsd(a: &[[f64; 3]], b: &[[f64; 3]]) -> f64 {
+    let sq: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(p, q)| (0..3).map(|c| (p[c] - q[c]).powi(2)).sum::<f64>())
+        .sum();
+    (sq / a.len() as f64).sqrt()
 }
 
 #[cfg(test)]

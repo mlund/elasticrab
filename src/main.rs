@@ -2,9 +2,9 @@
 //! animating modes into PDB or XTC trajectories. Built only with the `cli`
 //! feature; the library crate carries the analysis.
 
-// Readable accumulation sums are preferred over fused multiply-add, as in the
-// library crate.
-#![allow(clippy::suboptimal_flops)]
+// Mirror the library crate's deliberate clippy::nursery exceptions: readable sums
+// over fused multiply-add, and a binary `Some`/`None` match over `map_or_else`.
+#![allow(clippy::suboptimal_flops, clippy::option_if_let_else)]
 
 mod cli;
 

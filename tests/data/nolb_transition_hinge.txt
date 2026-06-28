@@ -1,0 +1,19 @@
+# NOLB structural-transition reference: crambin_heavy.pdb -> crambin_hinge.pdb.
+#
+# Generated once with the NOLB binary (Hoffmann & Grudinin, the engine Pepsi-SAXS
+# wraps); the test never invokes it. NOLB superposes the target onto the input and
+# fits the best linear combination of the lowest modes, reporting the RMSD it
+# closes. elasticrab matches the alignment / initial RMSD closely; its plain-RMSD
+# reduction is in the same regime but a few percent looser, because NOLB keeps
+# near-rigid modes (its null-space detection is incomplete: it reports null-space
+# size 2, not 6) and minimizes plain RMSD, whereas elasticrab removes all six rigid
+# modes and minimizes the mass-weighted RMSD. So this is a regime cross-check, not a
+# bit-exact golden.
+#
+# Command: NOLB crambin_heavy.pdb crambin_hinge.pdb -n 10 -s 20
+# NOLB version: 1.9, April 2020
+#
+# key value (Å, or fraction for reduction)
+initial_rmsd 0.5841
+final_rmsd 0.440621
+reduction 0.24564

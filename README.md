@@ -34,6 +34,7 @@ let amplitudes  = modes.thermal_amplitudes(300.0);
 - **Cell-list neighbour search** — linear in atom count; disconnected atoms are dropped, as Pepsi-SAXS / NOLB do.
 - **Mode visualization** — linear and NOLB nonlinear (bond-preserving) displacement.
 - **Conformational energy** — `NormalModes::energy()` scores any structure with the network's spring energy, for Boltzmann reweighting of sampled conformations.
+- **Structural transitions** — `NormalModes::transition()` Kabsch-aligns a target conformation, projects the native→target motion onto the modes, and morphs toward it (linear or NOLB-nonlinear), reporting per-mode overlap and RMSD reduction — NOLB's structure-to-structure transition.
 - **Command-line tool** (`cli` feature) — the `elasticrab` binary animates modes into PDB/XTC trajectories, with PDB/mmCIF input, VMD-like atom selection, a JSON report, and a per-frame energy table for Monte-Carlo reweighting.
 - **Tests** (`cargo test`) — property, analytic, and golden tests: exact ProDy spectra (1UBI, 2GB1) and ~6-digit NOLB agreement (crambin), including the disconnected-atom drop.
 - **Fixtures** — vendored reference data (ProDy Hessians and eigenvalues, NOLB frequencies), so tests need no external binary.
@@ -111,6 +112,7 @@ elasticrab protein.pdb -n 5 -o anim.xtc                   # five lowest modes ->
 elasticrab protein.pdb --select "chain A" --json out.json # restrict atoms; structured report
 elasticrab protein.pdb -n 5 -o pool.xtc --energy e.csv    # merge modes + per-frame energies
 elasticrab protein.pdb --b-factor-fit --frames 0          # fit gamma to the input's B-factors
+elasticrab protein.pdb --target other.pdb -n 10 -o morph.pdb  # morph toward a target conformation
 elasticrab protein.pdb --voronota -o mode1.pdb            # area-weighted Voronoi springs, not a cutoff
 elasticrab protein.pdb -n 5 -o p.xtc --energy e.csv --voromqa  # VoroMQA energy, not spring
 ```
@@ -144,6 +146,14 @@ to it if the fit fails). The default γ is
 a B-factor-fitted median over a small PDB set (`scripts/calibrate-gamma.sh`);
 since the fit is noisy across structures, pass `--b-factor-fit` for quantitative
 work.
+
+`--target <PDB>` morphs the structure toward a second conformation — NOLB's
+structure-to-structure transition. It superposes the target (Kabsch), projects the
+native→target motion onto the lowest `--modes` modes, and writes the morph to
+`--output` (nonlinear unless `--linear`). The report lists each mode's overlap with
+the motion, the cumulative overlap, and the RMSD remaining after each mode. The
+target must have the same atoms in the same order; mass-weighted modes are used
+(matching Pepsi/NOLB).
 
 ## Voronoi tessellation
 

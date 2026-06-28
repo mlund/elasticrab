@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use elasticrab::{Atom, Builder, NormalModes, Spring};
+use elasticrab::{Atom, Builder, NormalModes, Spring, Transition};
 use voronota_ltr::input::{
     build_residue_grouping, parse_file_with_records, AtomRecord, ParseOptions, RadiiLookup,
     Selection,
@@ -99,6 +99,16 @@ struct Cli {
     /// Columns: frame, mode, rmsd, energy (γ=1, Å²), energy_kJ_mol, weight.
     #[arg(long, value_name = "FILE")]
     energy: Option<PathBuf>,
+
+    /// Morph the structure toward a target conformation (PDB/mmCIF) along the
+    /// lowest --modes modes, NOLB's structure-to-structure transition.
+    ///
+    /// Projects the native→target motion onto the modes and writes the morph
+    /// trajectory to --output (nonlinear unless --linear). The target must have the
+    /// same atoms in the same order. Reports each mode's overlap and the RMSD
+    /// reduction. Pass `-n 10` (default 1) to fit with more modes.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["energy", "mode"])]
+    target: Option<PathBuf>,
 
     /// Use the VoroMQA contact-area energy for the --energy table, in place of the
     /// elastic spring energy.
@@ -244,6 +254,20 @@ fn execute(cli: &Cli) -> Result<(), String> {
                 modes.len()
             ));
         }
+    }
+
+    // A target conformation takes its own path: project native→target onto the
+    // modes and write the morph, instead of the per-mode animation or energy table.
+    if let Some(target_path) = cli.target.as_deref() {
+        return run_transition(
+            cli,
+            &options,
+            &radii,
+            &positions,
+            &records,
+            &modes,
+            target_path,
+        );
     }
 
     let (gamma, fit_r) = effective_gamma(cli, &atoms, &records, springs.as_deref())?;
@@ -677,6 +701,133 @@ fn file_stem(path: &Path) -> String {
 }
 
 /// Print the human-readable report to stdout, and write JSON to `--json` if set.
+/// `--target`: project the native→target motion onto the modes and write the
+/// morph. The target is parsed and `--select`-filtered exactly like the input, so
+/// the atoms line up; a count mismatch is an error (aligning differing structures
+/// is not yet supported).
+fn run_transition(
+    cli: &Cli,
+    options: &ParseOptions,
+    radii: &RadiiLookup,
+    native: &[[f64; 3]],
+    records: &[AtomRecord],
+    modes: &NormalModes,
+    target_path: &Path,
+) -> Result<(), String> {
+    let parsed = parse_file_with_records(target_path, options, radii)
+        .map_err(|e| format!("reading {}: {e}", target_path.display()))?;
+    let mut target_records = parsed.records;
+    if let Some(expr) = &cli.select {
+        let selection =
+            Selection::parse(expr).map_err(|e| format!("invalid selection {expr:?}: {e}"))?;
+        target_records.retain(|r| selection.matches(r));
+    }
+    if target_records.len() != native.len() {
+        return Err(format!(
+            "target {} has {} atoms after selection, but the structure has {}; the \
+             transition needs the same atoms in the same order",
+            target_path.display(),
+            target_records.len(),
+            native.len()
+        ));
+    }
+    let target: Vec<[f64; 3]> = target_records.iter().map(|r| [r.x, r.y, r.z]).collect();
+
+    let transition = modes
+        .transition(native, &target)
+        .map_err(|e| format!("transition failed: {e}"))?;
+    report_transition(cli, target_path, &transition)?;
+
+    if cli.frames > 0 {
+        let path = match cli.output.as_deref() {
+            Some(p) => p.to_path_buf(),
+            None => with_stem(&cli.input, |stem| format!("{stem}_morph.pdb")),
+        };
+        guard_input(&path, &cli.input)?;
+        let frames = transition
+            .morph(cli.frames, !cli.linear)
+            .map_err(|e| format!("morph failed: {e}"))?;
+        // The actual endpoint of the written trajectory — for a nonlinear morph this
+        // differs from the linear-fit residual the report prints.
+        let endpoint = frames
+            .last()
+            .map_or(0.0, |frame| transition.rmsd_to_target(frame));
+        write_trajectory(&path, records, &frames)?;
+        println!(
+            "  wrote {} ({} frames, {}, endpoint RMSD {endpoint:.4} Å)",
+            path.display(),
+            frames.len(),
+            if cli.linear { "linear" } else { "nonlinear" }
+        );
+    }
+    Ok(())
+}
+
+/// The transition report: per-mode overlap with the native→target motion, the
+/// running cumulative overlap, and the RMSD remaining after each mode.
+fn report_transition(cli: &Cli, target: &Path, t: &Transition<'_>) -> Result<(), String> {
+    let n = t.overlaps().len();
+    println!(
+        "elasticrab — {} → {}",
+        cli.input.display(),
+        target.display()
+    );
+    println!(
+        "  {n} mass-weighted modes, initial RMSD {:.4} Å (Cartesian)",
+        t.initial_rmsd()
+    );
+    // The residual column is the linear-fit RMSD after the lowest i+1 modes.
+    println!("  mode  overlap  cumulative  residual_rmsd");
+    for i in 0..n {
+        println!(
+            "  {:>4}  {:>7.3}  {:>10.3}  {:>13.4}",
+            i + 1,
+            t.overlaps()[i],
+            t.cumulative_overlap()[i],
+            t.residual_rmsd(i + 1)
+        );
+    }
+    println!("  best linear fit {:.4} Å", t.residual_rmsd(n));
+
+    if let Some(path) = &cli.json {
+        let json = transition_json(cli, target, t);
+        std::fs::write(path, json).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// The transition report as a JSON object (hand-written, like [`report_json`]).
+fn transition_json(cli: &Cli, target: &Path, t: &Transition<'_>) -> String {
+    let n = t.overlaps().len();
+    let mut s = String::from("{\n");
+    let _ = writeln!(
+        s,
+        "  \"input\": {},",
+        json_string(&cli.input.to_string_lossy())
+    );
+    let _ = writeln!(
+        s,
+        "  \"target\": {},",
+        json_string(&target.to_string_lossy())
+    );
+    let _ = writeln!(s, "  \"initial_rmsd\": {},", t.initial_rmsd());
+    let _ = writeln!(s, "  \"final_rmsd\": {},", t.residual_rmsd(n));
+    s.push_str("  \"modes\": [\n");
+    for i in 0..n {
+        let comma = if i + 1 < n { "," } else { "" };
+        let _ = writeln!(
+            s,
+            "    {{\"index\": {}, \"overlap\": {}, \"cumulative_overlap\": {}, \"residual_rmsd\": {}}}{comma}",
+            i + 1,
+            t.overlaps()[i],
+            t.cumulative_overlap()[i],
+            t.residual_rmsd(i + 1)
+        );
+    }
+    s.push_str("  ]\n}\n");
+    s
+}
+
 fn report(
     cli: &Cli,
     records: &[AtomRecord],
