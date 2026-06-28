@@ -3,12 +3,14 @@
 # Generated once with the NOLB binary (Hoffmann & Grudinin, the engine Pepsi-SAXS
 # wraps); the test never invokes it. NOLB superposes the target onto the input and
 # fits the best linear combination of the lowest modes, reporting the RMSD it
-# closes. elasticrab matches the alignment / initial RMSD closely; its plain-RMSD
-# reduction is in the same regime but a few percent looser, because NOLB keeps
-# near-rigid modes (its null-space detection is incomplete: it reports null-space
-# size 2, not 6) and minimizes plain RMSD, whereas elasticrab removes all six rigid
-# modes and minimizes the mass-weighted RMSD. So this is a regime cross-check, not a
-# bit-exact golden.
+# closes. NOLB uses the *same* mass-weighted projection elasticrab does — a disassembly
+# of the binary shows the amplitude is a BLAS `ddot` of the mass-weighted mode with
+# the per-atom √m-scaled displacement √m·(target-native), with an additive a²/|dq|²
+# reduction (no least-squares, no plain-RMSD minimization). elasticrab matches the
+# alignment / initial RMSD closely; its plain-RMSD reduction is a few percent looser
+# only because NOLB's null-space detection is incomplete (it reports null-space size 2,
+# not 6), so it keeps ~4 near-rigid low modes that elasticrab drops. So this is a
+# regime cross-check, not a bit-exact golden.
 #
 # Command: NOLB crambin_heavy.pdb crambin_hinge.pdb -n 10 -s 20
 # NOLB version: 1.9, April 2020

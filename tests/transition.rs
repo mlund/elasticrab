@@ -299,9 +299,11 @@ fn golden_value(name: &str, key: &str) -> f64 {
 fn cross_checks_against_nolb_on_a_hinge_motion() {
     // Regime cross-check, not a bit-exact golden — see the header of
     // tests/data/nolb_transition_hinge.txt for the command, NOLB version, and why
-    // the conventions differ by a few percent (NOLB keeps near-rigid modes and
-    // minimizes plain RMSD; we remove all six rigid modes and minimize the
-    // mass-weighted RMSD). The precise correctness is pinned by the analytic tests.
+    // the results differ by a few percent. NOLB uses the *same* mass-weighted
+    // dot-product projection we do (confirmed by disassembly: a `ddot` of the
+    // mass-weighted mode with √m·Δr, additive a²/|dq|² reduction); the gap is that
+    // its null-space detection reports size 2, not 6, so it keeps ~4 near-rigid low
+    // modes we drop. The precise correctness is pinned by the analytic tests.
     let nolb_initial = golden_value("nolb_transition_hinge.txt", "initial_rmsd");
     let nolb_final = golden_value("nolb_transition_hinge.txt", "final_rmsd");
 
