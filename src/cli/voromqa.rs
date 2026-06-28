@@ -9,9 +9,13 @@
 //! E = Σ_ij  A_ij · e(type_i, type_j, class_ij)  +  Σ_a  SAS_a · e(type_a, solvent)
 //! ```
 //!
-//! where `class` is (centrality)×(sequence separation). The contact areas, the
-//! centrality flag, and the per-atom solvent-accessible area all come from a single
-//! Voronoi tessellation (voronota-ltr), so this is fully in-process.
+//! where `class` is centrality crossed with sequence separation. Following the
+//! reference (`ignorable_max_seq_sep = 1`), same-chain contacts at sequence
+//! separation ≤ 1 are excluded — their area is fixed by the covalent backbone — so
+//! every scored contact is `sep2`/`central_sep2` and the `sep1` columns go unused.
+//! The contact areas, the centrality flag, and the per-atom solvent-accessible area
+//! all come from a single Voronoi tessellation (voronota-ltr), so this is fully
+//! in-process.
 //!
 //! The `e(...)` weights are dimensionless log-odds, so the energy is in arbitrary
 //! units (area, Å², times a statistical weight), **not** kJ/mol. It is meaningful
@@ -148,13 +152,15 @@ impl Potential {
             if !self.solvent.contains_key(ta) || !self.solvent.contains_key(tb) {
                 continue;
             }
-            let Some(adjacent) = sequence_adjacent(&records[c.id_a], &records[c.id_b]) else {
-                continue; // same residue — intra-residue contacts are not scored
-            };
+            if !is_scored(&records[c.id_a], &records[c.id_b]) {
+                continue; // same residue or sequence-adjacent (ignorable_max_seq_sep = 1)
+            }
+            // Every scored contact is `sep2`: upstream tags `sep1` only for same-chain
+            // separation 1, which the exclusion above removes, so `sep1` is never read.
             let e = self
                 .pairs
                 .get(&canonical(ta, tb))
-                .map_or(0.0, |arr| arr[class_index(c.central, adjacent)]);
+                .map_or(0.0, |arr| arr[class_index(c.central, false)]);
             energy += c.area * e;
         }
         // One-body solvent (burial) term, from per-atom solvent-accessible area. An
@@ -244,18 +250,16 @@ fn canonical(a: &str, b: &str) -> (String, String) {
     }
 }
 
-/// Whether two atoms' residues are sequence-*adjacent* (separation 1 in the same
-/// chain): `Some(true)` ⇒ `sep1`, `Some(false)` ⇒ `sep2` (separation ≥ 2, or a
-/// different chain), `None` ⇒ same residue (separation 0, not scored).
-fn sequence_adjacent(a: &AtomRecord, b: &AtomRecord) -> Option<bool> {
-    if a.chain_id != b.chain_id {
-        return Some(false);
-    }
-    match (a.res_seq - b.res_seq).abs() {
-        0 => None,
-        1 => Some(true),
-        _ => Some(false),
-    }
+/// Whether a contact enters the score. Mirrors the reference's `ignorable_max_seq_sep
+/// = 1`: a same-chain contact at sequence separation ≤ 1 — same residue, or a
+/// sequence-adjacent (typically peptide-bonded) neighbour — is excluded, since its
+/// area is fixed by the covalent backbone and carries no packing signal. Everything
+/// else (separation ≥ 2, or a different chain) is scored, always in a `sep2` class.
+///
+/// A rare peptide bond between non-consecutive residue numbers (a renumbered chain
+/// break) is the one case upstream also excludes that this does not.
+fn is_scored(a: &AtomRecord, b: &AtomRecord) -> bool {
+    a.chain_id != b.chain_id || (a.res_seq - b.res_seq).abs() >= 2
 }
 
 #[cfg(test)]
@@ -303,11 +307,13 @@ mod tests {
     }
 
     #[test]
-    fn sequence_separation_classifies() {
-        assert_eq!(sequence_adjacent(&rec("A", 1), &rec("A", 2)), Some(true)); // sep1
-        assert_eq!(sequence_adjacent(&rec("A", 1), &rec("A", 5)), Some(false)); // sep2
-        assert_eq!(sequence_adjacent(&rec("A", 3), &rec("A", 3)), None); // same residue
-        assert_eq!(sequence_adjacent(&rec("A", 1), &rec("B", 1)), Some(false)); // other chain
+    fn sequence_separation_exclusion() {
+        // Same residue and sequence-adjacent contacts are excluded (sep ≤ 1).
+        assert!(!is_scored(&rec("A", 3), &rec("A", 3))); // same residue
+        assert!(!is_scored(&rec("A", 1), &rec("A", 2))); // adjacent
+                                                         // Separation ≥ 2 and inter-chain contacts are scored.
+        assert!(is_scored(&rec("A", 1), &rec("A", 5))); // sep2
+        assert!(is_scored(&rec("A", 1), &rec("B", 1))); // other chain
     }
 
     #[test]
