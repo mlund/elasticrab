@@ -26,10 +26,12 @@ pub(crate) struct Contact {
 /// systems. The result is exactly the brute-force contact set; only the order
 /// differs, which no consumer depends on (they all accumulate).
 pub(crate) fn contacts(positions: &[[f64; 3]], cutoff: f64) -> Vec<Contact> {
-    // A non-positive or NaN cutoff makes the grid spacing meaningless; fall back
-    // to the exact pairwise scan, which handles it correctly.
+    // A non-positive or NaN cutoff has no interaction range, so there are no
+    // contacts at all — squaring it (the old brute-force fallback) would silently
+    // treat a negative cutoff as positive. (The CLI rejects this up front; a library
+    // caller gets an empty network, i.e. every atom disconnected.)
     if cutoff <= 0.0 || cutoff.is_nan() {
-        return brute_force(positions, cutoff);
+        return Vec::new();
     }
 
     let grid = Grid::new(positions, cutoff);
@@ -155,8 +157,8 @@ impl Grid {
     }
 }
 
-/// Exact `O(n²)` pairwise scan: the fallback for a degenerate cutoff and the
-/// oracle the cell list is tested against.
+/// Exact `O(n²)` pairwise scan — the oracle the cell list is tested against.
+#[cfg(test)]
 fn brute_force(positions: &[[f64; 3]], cutoff: f64) -> Vec<Contact> {
     let cutoff2 = cutoff * cutoff;
     let mut out = Vec::new();
@@ -181,6 +183,16 @@ mod tests {
         assert_eq!(c.len(), 1);
         assert_eq!((c[0].i, c[0].j), (0, 1));
         assert_eq!(c[0].dist2, 1.0);
+    }
+
+    #[test]
+    fn non_positive_or_nan_cutoff_yields_no_contacts() {
+        // A negative cutoff must not be squared into a positive search radius; a
+        // non-finite-and-positive cutoff means "no interaction range" → no contacts.
+        let pos = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [3.0, 0.0, 0.0]];
+        for bad in [-1.5, 0.0, f64::NAN] {
+            assert!(contacts(&pos, bad).is_empty(), "cutoff {bad} gave contacts");
+        }
     }
 
     #[test]

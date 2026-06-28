@@ -175,6 +175,7 @@ pub fn run() -> ExitCode {
 
 fn execute(cli: &Cli) -> Result<(), String> {
     for (name, value) in [
+        ("--cutoff", cli.cutoff),
         ("--gamma", cli.gamma),
         ("--temperature", cli.temperature),
         ("--sigmas", cli.sigmas),

@@ -13,17 +13,19 @@ analysis**: give it atoms, get back the vibrational modes of an elastic network.
 ```rust
 use elasticrab::{Atom, NormalModes};
 
-let atoms = vec![
-    Atom { position: [0.0, 0.0, 0.0], mass: 12.0 },
-    Atom { position: [3.8, 0.0, 0.0], mass: 12.0 },
-    Atom { position: [3.8, 3.8, 0.0], mass: 12.0 },
-];
+fn main() -> Result<(), elasticrab::Error> {
+    let atoms = vec![
+        Atom { position: [0.0, 0.0, 0.0], mass: 12.0 },
+        Atom { position: [3.8, 0.0, 0.0], mass: 12.0 },
+        Atom { position: [3.8, 3.8, 0.0], mass: 12.0 },
+    ];
 
-let modes = NormalModes::builder(&atoms).cutoff(15.0).solve()?;
-let eigenvalues = modes.eigenvalues();   // ascending; first ~6 ≈ 0 (rigid body)
-let first_mode  = modes.eigenvector(6);  // per-atom displacement field
-let amplitudes  = modes.thermal_amplitudes(300.0);
-# Ok::<(), elasticrab::Error>(())
+    let modes = NormalModes::builder(&atoms).cutoff(15.0).solve()?;
+    let eigenvalues = modes.eigenvalues();  // ascending; first ~6 ≈ 0 (rigid body)
+    let first_mode  = modes.eigenvector(6); // per-atom displacement field
+    let amplitudes  = modes.thermal_amplitudes(300.0);
+    Ok(())
+}
 ```
 
 ## Features
@@ -36,7 +38,7 @@ let amplitudes  = modes.thermal_amplitudes(300.0);
 - **Conformational energy** — `NormalModes::energy()` scores any structure with the network's spring energy, for Boltzmann reweighting of sampled conformations.
 - **Structural transitions** — `NormalModes::transition()` Kabsch-aligns a target conformation, projects the native→target motion onto the modes, and morphs toward it (linear or NOLB-nonlinear), reporting per-mode overlap and RMSD reduction — NOLB's structure-to-structure transition.
 - **Command-line tool** (`cli` feature) — the `elasticrab` binary animates modes into PDB/XTC trajectories, with PDB/mmCIF input, VMD-like atom selection, a JSON report, and a per-frame energy table for Monte-Carlo reweighting.
-- **Tests** (`cargo test`) — property, analytic, and golden tests: exact ProDy spectra (1UBI, 2GB1) and ~6-digit NOLB agreement (crambin), including the disconnected-atom drop.
+- **Tests** (`cargo test`) — property, analytic, and golden tests: ProDy spectra to `atol = 1e-5` (1UBI, 2GB1) and NOLB-proportional frequencies to ~0.1% (crambin), including the disconnected-atom drop.
 - **Fixtures** — vendored reference data (ProDy Hessians and eigenvalues, NOLB frequencies), so tests need no external binary.
 
 ## What it does
@@ -77,13 +79,14 @@ neighbour search is a cell list, linear in the atom count.
 
 ## Validation
 
-`cargo test` reproduces independent references. The spectrum matches ProDy's
-published values exactly, for both the plain ANM (1UBI) and the rigid-block
-reduction (2GB1). The mass-weighted rigid-block path matches **NOLB** — the
-engine Pepsi-SAXS wraps — to about six digits on crambin, including the
-disconnected-atom drop: adding an isolated atom leaves the spectrum unchanged,
-exactly as NOLB reports it. Property and analytic checks cover Hessian symmetry,
-the rigid-body null space, the diatomic reduced-mass relation
+`cargo test` reproduces independent references. The Hessian and eigenvalues match
+**ProDy**'s vendored reference data to ProDy's own test tolerance (`atol = 1e-5`),
+for both the plain ANM (1UBI) and the rigid-block reduction (2GB1). The mass-weighted
+rigid-block frequencies are *proportional* to **NOLB**'s — the engine Pepsi-SAXS
+wraps — to ~0.1% (`1e-3`) on crambin (NOLB reports `√eigenvalue` up to a global unit
+constant), including the disconnected-atom drop: adding an isolated atom leaves the
+spectrum unchanged, exactly as NOLB reports. Property and analytic checks cover
+Hessian symmetry, the rigid-body null space, the diatomic reduced-mass relation
 `ω² = γ(1/m₁ + 1/m₂)`, and the error paths.
 
 ## Visualizing a mode
@@ -204,9 +207,12 @@ separation ≤ 1 are excluded — their area is fixed by the covalent backbone �
 scored contact is `central_sep2` or `sep2`, and the `sep1` columns go unused. The
 harmonic NMA still generates the frames; only
 the per-frame score changes, re-tessellated each frame. Because $`E_\text{VoroMQA}`$
-is area-based (Å²) like the spring energy, `--gamma` (kJ/mol/Å²) scales it to
-`energy_kJ_mol` and `weight` exactly as above — a tuning knob, since γ's
-B-factor-fitted default suits the springs. `--voromqa-file <path>` supplies a
+is area-based (Å²) like the spring energy, `--gamma` (kJ/mol/Å²) scales it into the
+same `energy_kJ_mol`/`weight` columns — but **here γ is a free tuning knob, not a
+physical constant**: the VoroMQA score is a dimensionless log-odds × area, so those
+columns carry kJ/mol *units* without a physical calibration. Only the relative
+weights matter; tune γ to set the spread (its B-factor-fitted default suits the
+springs, not VoroMQA). `--voromqa-file <path>` supplies a
 different potential; `--voromqa` and `--voromqa-file` are mutually exclusive and both
 require `--energy`.
 

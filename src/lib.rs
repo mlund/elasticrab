@@ -620,14 +620,17 @@ impl NormalModes {
         })
     }
 
-    /// Number of modes: three per connected atom for the plain model, or the
-    /// reduced rigid-block degree-of-freedom count for a rigid-block (RTB) solve.
+    /// Number of modes returned. A full solve gives all of them — three per
+    /// connected atom for the plain model, or the reduced rigid-block
+    /// degree-of-freedom count for a rigid-block (RTB) solve. [`Builder::k_modes`]
+    /// instead returns just the requested `k` lowest *non-zero* modes (the
+    /// rigid-body null space dropped).
     pub const fn len(&self) -> usize {
         self.eigenvalues.len()
     }
 
-    /// Whether there are no modes — always false for a successful solve, provided
-    /// as the conventional companion to [`len`](Self::len).
+    /// Whether there are no modes. False for any non-degenerate solve; only
+    /// `k_modes(0)`, or a network with no springs, yields an empty result.
     pub const fn is_empty(&self) -> bool {
         self.eigenvalues.is_empty()
     }
@@ -639,7 +642,9 @@ impl NormalModes {
         self.springs.len()
     }
 
-    /// Eigenvalues in ascending order. The first ~6 are approximately zero.
+    /// Eigenvalues in ascending order. In a full solve the first ~6 are
+    /// approximately zero (the rigid-body modes); a [`Builder::k_modes`] solve omits
+    /// those and returns only the lowest non-zero eigenvalues.
     pub fn eigenvalues(&self) -> &[f64] {
         &self.eigenvalues
     }
@@ -933,9 +938,14 @@ impl NormalModes {
         &self.disconnected
     }
 
-    /// Thermal RMS amplitudes `√(2·k_B·T / λ_i)` per mode at temperature `T`
-    /// (kelvin). Rigid-body modes (eigenvalue ≈ 0) are reported as `0.0` so the
-    /// returned slice stays index-aligned with [`eigenvalues`](Self::eigenvalues).
+    /// Thermal amplitude `√(2·R·T / λ_i)` per mode at temperature `T` (kelvin): the
+    /// classical turning point where a mode's potential energy reaches `R·T`
+    /// (`½λa² = R·T`). This is the convention Pepsi-SAXS / NOLB use (their
+    /// `√(2·k_B·T/λ)`) — `√2 ×` the equipartition RMS `√(R·T/λ)` behind
+    /// [`fluctuations`](Self::fluctuations), *not* the RMS itself. It is `R·T`
+    /// (molar), not `k_B·T`, because the eigenvalues are per-mole. Rigid-body modes
+    /// (eigenvalue ≈ 0) are reported as `0.0` so the returned slice stays
+    /// index-aligned with [`eigenvalues`](Self::eigenvalues).
     ///
     /// The absolute scale is arbitrary in an ANM (it rides on `gamma`); the
     /// useful information is the *relative* amplitude across modes.
