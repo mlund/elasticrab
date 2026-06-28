@@ -30,6 +30,18 @@
 //! ideal for small and medium systems. [`Builder::k_modes`] returns only the
 //! lowest *k* non-zero modes; the optional `sparse` feature then computes them
 //! without forming the dense Hessian, which is what scales to large systems.
+//!
+//! # Units
+//!
+//! Lengths are unit-agnostic: positions, cutoff, displacements, and RMSDs are all in
+//! whatever length unit you choose, used consistently (ångström by convention).
+//! [`gamma`](Builder::gamma) is the bridge — an energy per squared length — so
+//! [`energy`](NormalModes::energy) comes out in `gamma`'s energy unit and
+//! [`fluctuations`](NormalModes::fluctuations) in your squared length unit. The thermal
+//! terms ([`fluctuations`](NormalModes::fluctuations) and
+//! [`thermal_amplitudes`](NormalModes::thermal_amplitudes)) use the molar gas constant
+//! for `RT`, so they assume `gamma` is in **kJ/mol per squared length** — kJ/mol/Å² for
+//! ångström, giving Å² fluctuations.
 
 #![deny(missing_docs)]
 // Deliberate choices that conflict with three `clippy::nursery` lints:
@@ -62,7 +74,8 @@ use rtb::BlockGeometry;
 /// atom equally, matching the conventional ANM.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Atom {
-    /// Cartesian coordinates, in ångström.
+    /// Cartesian coordinates, in any consistent length unit (ångström by convention;
+    /// see the crate-level [Units](crate#units) note).
     pub position: [f64; 3],
     /// Atomic mass; only used when mass-weighting is enabled.
     pub mass: f64,
@@ -844,7 +857,7 @@ impl NormalModes {
     ///
     /// Projection happens in the modes' own metric (mass-weighted when the modes
     /// are), where they are orthonormal, so each coefficient is a plain dot product;
-    /// the reported RMSDs are always plain Cartesian (Å).
+    /// the reported RMSDs are always plain Cartesian (in the positions' length unit).
     ///
     /// # Errors
     /// [`Error::AtomCountMismatch`] unless `native` and `target` each have one entry
@@ -1094,8 +1107,8 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Connect every pair of atoms within `cutoff` ångström by a uniform spring.
-    /// Mutually exclusive with [`springs`](Self::springs).
+    /// Connect every pair of atoms within `cutoff` (in the positions' length unit) by a
+    /// uniform spring. Mutually exclusive with [`springs`](Self::springs).
     #[must_use]
     pub const fn cutoff(mut self, cutoff: f64) -> Self {
         self.cutoff = Some(cutoff);
@@ -1113,6 +1126,10 @@ impl<'a> Builder<'a> {
 
     /// Global spring constant `γ₀` (default `1.0`); the spring constant of edge `ij`
     /// is `γ₀ · weight`. It scales every eigenvalue, setting only the overall scale.
+    ///
+    /// Dimensionally it is an energy per squared length, so its area unit follows the
+    /// positions: kJ/mol/Å² for ångström, kJ/mol/nm² for nanometre, etc. (the thermal
+    /// terms assume the energy is kJ/mol — see the crate [Units](crate#units) note).
     #[must_use]
     pub const fn gamma(mut self, gamma: f64) -> Self {
         self.params.gamma = gamma;
@@ -1191,13 +1208,13 @@ impl Transition<'_> {
         &self.cumulative_overlap
     }
 
-    /// Plain Cartesian RMSD (Å) between `native` and the rigid-body-aligned target —
+    /// Plain Cartesian RMSD between `native` and the rigid-body-aligned target —
     /// the gap the modes try to close.
     pub fn initial_rmsd(&self) -> f64 {
         self.residuals[0]
     }
 
-    /// Plain Cartesian RMSD (Å) the *linear* fit leaves after the lowest `k` modes
+    /// Plain Cartesian RMSD the *linear* fit leaves after the lowest `k` modes
     /// (`k` clamped to the available modes): `residual_rmsd(0)` is the initial RMSD,
     /// `residual_rmsd(len)` the best this mode set achieves. The nonlinear morph's
     /// endpoint differs slightly — see [`rmsd_to_target`](Self::rmsd_to_target).
@@ -1205,7 +1222,7 @@ impl Transition<'_> {
         self.residuals[k.min(self.amplitudes.len())]
     }
 
-    /// Rigid-body-minimized Cartesian RMSD (Å) of an arbitrary structure to the target —
+    /// Rigid-body-minimized Cartesian RMSD of an arbitrary structure to the target —
     /// e.g. the actual endpoint of a nonlinear [`morph`](Self::morph), which the linear
     /// [`residual_rmsd`](Self::residual_rmsd) does not describe. The target is re-superposed
     /// (Kabsch) onto `structure`, so a nonlinear morph's residual rigid drift is removed —
