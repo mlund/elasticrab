@@ -266,28 +266,49 @@ Every cutoff spring has unit relative weight, so the global spring constant
 Voronoi tessellation is ElastiCrab's distinctive network option. It replaces a
 distance cutoff with contact geometry.
 
-With `--voronota`, ElastiCrab builds a Laguerre, or radical, tessellation of the
-atoms using the `voronota-ltr` library and a 1.4 Å solvent probe. Two atoms
-contact each other when their cells share a face. The area of that face,
-$A_{ij}$, becomes the contact strength. An atom between two others screens their
-contact, so the network is occlusion-aware rather than distance-only.
+With `--voronota`, ElastiCrab calls `voronota-ltr` in process. It represents
+each selected atom as a ball with its parsed coordinates and Voronota radius,
+then computes radical-tessellation contacts with a 1.4 Å solvent probe. Each
+returned contact contains two atom indices, `id_a` and `id_b`, and the shared
+cell-face area, $A_{ij}$. ElastiCrab creates one elastic spring for each
+returned contact, using `id_a` and `id_b` as the spring endpoints.
 
-The spring weight is
-
-$$
-w_{ij} = \frac{A_{ij}}{\bar{A}}
-$$
-
-with
+Contact area is a physical proxy for mechanical coupling. In a coarse elastic
+model, a broad packing interface should resist relative displacement more than a
+small grazing contact. ElastiCrab therefore uses contact area as a relative
+stiffness, not as a first-principles force constant. It first computes the mean
+contact area
 
 $$
 \bar{A} = \frac{1}{N_c}\sum_{(i,j)} A_{ij}
 $$
 
-where $N_c$ is the number of contacts. This normalization gives the Voronoi
-network a mean spring weight of 1, so `--gamma` keeps the same role as in the
-cutoff model. The connectivity still differs from the cutoff network, so
-absolute frequencies from the two models should not be compared directly.
+where $N_c$ is the number of `voronota-ltr` contacts. It then assigns the
+dimensionless spring weight
+
+$$
+w_{ij} = \frac{A_{ij}}{\bar{A}}
+$$
+
+so the effective spring constant is $k_{ij}=\gamma w_{ij}$. This normalization
+gives the Voronoi network a mean spring weight of 1, so `--gamma` keeps the same
+role as in the cutoff model.
+
+The spring rest length is the native distance between the two atoms. During
+Hessian assembly, each Voronoi spring contributes the usual ANM block with the
+area-derived weight:
+
+$$
+H_{ij} = -\frac{\gamma w_{ij}}{d_{ij}^2}\,\Delta\mathbf{r}_{ij}\Delta\mathbf{r}_{ij}^{T}
+$$
+
+where $\Delta\mathbf{r}_{ij}=\mathbf{r}_j^0-\mathbf{r}_i^0$ and
+$d_{ij}=|\Delta\mathbf{r}_{ij}|$. The diagonal blocks receive the opposite row
+sums. This construction makes the network occlusion-aware: an atom between two
+others can remove or reduce their shared Voronoi face, whereas a distance cutoff
+would still connect them. The connectivity still differs from the cutoff
+network, so absolute frequencies from the two models should not be compared
+directly.
 
 Voronoi tessellation matters in two places:
 
@@ -390,9 +411,28 @@ E_\text{VoroMQA} =
 $$
 
 Here $t_i$ is the atom type, $A_{ij}$ is the Voronoi contact area, $c_{ij}$ is
-the contact class, and $S_i$ is the solvent-accessible area. Same-chain contacts
-with sequence separation 0 or 1 are ignored, following the reference VoroMQA
-scheme.
+the contact class, and $S_i$ is the solvent-accessible area.
+
+ElastiCrab applies the following inclusion rules:
+
+- A pair contact is scored only if both atom types are present in the potential.
+- Same-chain contacts with residue-number separation 0 or 1 are skipped. These
+  are same-residue and sequence-adjacent contacts, whose area is dominated by
+  covalent geometry.
+- Same-chain contacts with residue-number separation 2 or more are scored.
+  Inter-chain contacts are scored regardless of residue numbers.
+- Scored pair contacts use the `central_sep2` class when the `voronota-ltr`
+  contact is central, and `sep2` otherwise. The `sep1` classes are not used
+  after sequence-adjacent contacts are skipped.
+- A known atom type with no matching pair/class coefficient contributes zero for
+  that pair contact.
+
+The solvent term includes every atom whose type has a solvent coefficient. Atoms
+without a coefficient are skipped from both the pair and solvent terms, and the
+CLI prints a warning. If an atom has no Voronoi cell in a frame, ElastiCrab
+treats it as fully exposed and uses $S_i=4\pi(r_i+1.4)^2$. Custom potential
+files must use the centrality-only classes `central_sep1`, `central_sep2`,
+`sep1`, and `sep2`; files with peripheral classes are rejected.
 
 ElastiCrab evaluates this score in process with `voronota-ltr`, not with the
 full Voronota executable. The bundled coefficients were derived for full
