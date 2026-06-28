@@ -963,6 +963,42 @@ impl NormalModes {
             .collect()
     }
 
+    /// Brüschweiler collectivity `κ` of mode `i`: how many atoms move together,
+    /// `κ ∈ [1/N, 1]` with `N·κ` the *effective number of moving atoms* (`κ = 1`
+    /// fully collective, `κ = 1/N` a single atom). `N` is the connected-atom count.
+    ///
+    /// `κ = (1/N)·exp(−Σₙ pₙ·ln pₙ)`, where `pₙ` is the mode's **physical** per-atom
+    /// squared displacement `|vₙ/√mₙ|²` ([`mode_displacement`](Self::mode_displacement)),
+    /// normalized to sum to 1 — `exp(entropy)` of that distribution, over `N`. This
+    /// matches NOLB's `--collectivity` (which likewise un-weights the mass-weighted
+    /// modes before forming the distribution). Disconnected atoms contribute zero.
+    ///
+    /// # Panics
+    /// If `i >= self.len()`.
+    pub fn collectivity(&self, i: usize) -> f64 {
+        let amplitudes = self.mode_displacement(i);
+        let squared = |d: &[f64; 3]| d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        let total: f64 = amplitudes.iter().map(squared).sum();
+        if total <= 0.0 {
+            return 0.0; // a degenerate all-zero mode; κ is undefined
+        }
+        // Shannon entropy (nats) of the normalized per-atom amplitude; exp(entropy) is
+        // the effective participating-atom count, which κ expresses as a fraction of N.
+        let entropy: f64 = amplitudes
+            .iter()
+            .map(|d| {
+                let p = squared(d) / total;
+                if p > 0.0 {
+                    -p * p.ln()
+                } else {
+                    0.0
+                }
+            })
+            .sum();
+        let connected = (self.n_atoms - self.disconnected.len()) as f64;
+        entropy.exp() / connected
+    }
+
     /// Predicted thermal fluctuation `⟨Δrₐ²⟩ = RT Σᵢ (1/λᵢ) |vᵢ(a)|²` of each
     /// atom at temperature `T` (kelvin), summed over the non-zero modes — the
     /// quantity behind crystallographic B-factors, `B = (8π²/3)⟨Δr²⟩`. (`RT`, not

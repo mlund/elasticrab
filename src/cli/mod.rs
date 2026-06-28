@@ -862,9 +862,15 @@ fn report(
         Some(r) => println!("  gamma {gamma:.4} kJ/mol/Å² (fitted, B-factor r = {r:.3})"),
         None => println!("  gamma {gamma:.4} kJ/mol/Å²"),
     }
-    println!("  mode  frequency");
+    // Collectivity κ (NOLB's `--collectivity`) is one cheap O(atoms) pass per mode and
+    // is exactly what you need to pick modes, so it is always shown — no flag.
+    println!("  mode  frequency  collectivity");
     for (j, frequency) in frequencies.iter().enumerate() {
-        println!("  {:>4}  {frequency:.6}", j + 1);
+        println!(
+            "  {:>4}  {frequency:.6}  {:>12.4}",
+            j + 1,
+            modes.collectivity(j)
+        );
     }
 
     if let Some(path) = &cli.json {
@@ -922,8 +928,9 @@ fn report_json(
         let comma = if j + 1 < frequencies.len() { "," } else { "" };
         let _ = writeln!(
             s,
-            "    {{\"index\": {}, \"frequency\": {frequency}, \"eigenvalue\": {eigenvalue}}}{comma}",
-            j + 1
+            "    {{\"index\": {}, \"frequency\": {frequency}, \"eigenvalue\": {eigenvalue}, \"collectivity\": {}}}{comma}",
+            j + 1,
+            modes.collectivity(j)
         );
     }
     s.push_str("  ]\n}\n");

@@ -36,9 +36,10 @@ fn main() -> Result<(), elasticrab::Error> {
 - **Cell-list neighbour search** — linear in atom count; disconnected atoms are dropped, as Pepsi-SAXS / NOLB do.
 - **Mode visualization** — linear and NOLB nonlinear (bond-preserving) displacement.
 - **Conformational energy** — `NormalModes::energy()` scores any structure with the network's spring energy, for Boltzmann reweighting of sampled conformations.
+- **Mode analysis** — `NormalModes::collectivity()` is the Brüschweiler κ (NOLB's `--collectivity`): the effective fraction of atoms a mode moves, for picking collective modes; shown per mode in the report.
 - **Structural transitions** — `NormalModes::transition()` Kabsch-aligns a target conformation, projects the native→target motion onto the modes, and morphs toward it (linear or NOLB-nonlinear), reporting per-mode overlap and RMSD reduction — NOLB's structure-to-structure transition.
 - **Command-line tool** (`cli` feature) — the `elasticrab` binary animates modes into PDB/XTC trajectories, with PDB/mmCIF input, VMD-like atom selection, a JSON report, and a per-frame energy table for Monte-Carlo reweighting.
-- **Tests** (`cargo test`) — property, analytic, and golden tests: ProDy spectra to `atol = 1e-5` (1UBI, 2GB1) and NOLB-proportional frequencies to ~0.1% (crambin), including the disconnected-atom drop.
+- **Tests** (`cargo test`) — property, analytic, and golden tests: ProDy spectra to `atol = 1e-5` (1UBI, 2GB1), NOLB-proportional frequencies to ~0.1% and per-mode collectivities to <0.03 (crambin), including the disconnected-atom drop.
 - **Fixtures** — vendored reference data (ProDy Hessians and eigenvalues, NOLB frequencies), so tests need no external binary.
 
 ## What it does
@@ -85,7 +86,8 @@ for both the plain ANM (1UBI) and the rigid-block reduction (2GB1). The mass-wei
 rigid-block frequencies are *proportional* to **NOLB**'s — the engine Pepsi-SAXS
 wraps — to ~0.1% (`1e-3`) on crambin (NOLB reports `√eigenvalue` up to a global unit
 constant), including the disconnected-atom drop: adding an isolated atom leaves the
-spectrum unchanged, exactly as NOLB reports. Property and analytic checks cover
+spectrum unchanged, exactly as NOLB reports. Per-mode collectivities match NOLB's
+`--analyze` on crambin's lowest 20 modes to <0.03. Property and analytic checks cover
 Hessian symmetry, the rigid-body null space, the diatomic reduced-mass relation
 `ω² = γ(1/m₁ + 1/m₂)`, and the error paths.
 

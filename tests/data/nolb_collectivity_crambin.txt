@@ -1,0 +1,34 @@
+# NOLB NMA collectivity reference: crambin_heavy.pdb.
+#
+# Bruschweiler collectivity kappa (NOLB manual Eq 3.1/3.2; ref [13]) for the 20
+# lowest non-zero modes, generated once with the NOLB binary (Hoffmann & Grudinin,
+# the engine Pepsi-SAXS wraps); the test never invokes it.
+#
+# Command: NOLB crambin_heavy.pdb --analyze -n 20 -s 0
+# NOLB version: 1.9, April 2020
+#
+# NOLB mode [k] is elasticrab's mode 5+k (the 6-mode rigid-body null space dropped).
+# kappa = (1/N) exp(-sum_n p_n ln p_n), p_n the physical per-atom squared amplitude
+# |v_n/sqrt(m_n)|^2 normalized to sum 1 (the eigenvector components divided by mass).
+#
+# mode  collectivity
+1   0.456904
+2   0.518337
+3   0.148589
+4   0.522369
+5   0.641129
+6   0.551050
+7   0.097933
+8   0.536805
+9   0.410890
+10  0.422041
+11  0.674034
+12  0.667901
+13  0.552499
+14  0.514969
+15  0.385137
+16  0.450950
+17  0.544881
+18  0.545763
+19  0.505437
+20  0.317225

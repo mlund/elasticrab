@@ -236,7 +236,7 @@ fn displace_by_amplitudes_sums_physical_modes() {
 
     // Linear: native + Σ aᵢ·mode_displacement(i), the amplitude→coordinates map.
     let got = mw.displace_by_amplitudes(&native, &amps, false).unwrap();
-    let mut want = native.clone();
+    let mut want = native;
     for (i, &a) in amps.iter().enumerate() {
         for (w, u) in want.iter_mut().zip(&mw.mode_displacement(i)) {
             w[0] += a * u[0];
