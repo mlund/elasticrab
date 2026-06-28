@@ -212,14 +212,19 @@ require `--energy`.
 
 **Relation to full Voronota.** elasticrab evaluates the score in-process with the
 lightweight [voronota-ltr](https://github.com/mlund/voronota-ltr) tessellation, not
-the full [Voronota](https://github.com/kliment-olechnovic/voronota) engine, so the
-absolute energy does not reproduce a `voronota-voromqa` run bit-for-bit: voronota-lt's
-contour-based centrality and contact areas differ slightly from Voronota's exact
-tessellation. On crambin the solvent term and total contact area agree to within
-0.5%, but the net energy — a small difference between two large terms of opposite sign
-(favourable contacts, unfavourable burial) — is more sensitive to it. This is a fixed
-scale offset, harmless for the native-referenced reweighting used here (it shifts
-every frame together), but worth knowing before comparing absolute scores.
+the full [Voronota](https://github.com/kliment-olechnovic/voronota) engine — and the
+v1 coefficients were *derived* on full-Voronota areas (Olechnovic, pers. comm.), so
+applying them to the slightly different LT areas is approximate by construction and
+does not reproduce a `voronota-voromqa` run bit-for-bit. On crambin the solvent term
+and total contact area agree to within 0.5%, but the net energy — a small difference
+between two large terms of opposite sign (favourable contacts, unfavourable burial) —
+is more sensitive to it. Because the LT bias is largely *systematic*, it should mostly
+cancel in the native-referenced ΔE the reweighting uses (`E_frame − E_native`); only
+the native frame was cross-checked, so treat that as the expectation rather than a
+measured guarantee, and do not compare the absolute score to canonical VoroMQA. (The
+0–1 VoroMQA *quality* score needs a further `means_and_sds` per-atom-type
+normalization, not implemented here — the raw pseudo-energy is what the MC weights
+use.)
 
 ## Benchmarks
 

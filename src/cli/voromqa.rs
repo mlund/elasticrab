@@ -17,6 +17,14 @@
 //! all come from a single Voronoi tessellation (voronota-ltr), so this is fully
 //! in-process.
 //!
+//! **Approximation.** The v1 coefficients were derived (Olechnovic, pers. comm.)
+//! from contact areas computed by the *full* Voronota, not voronota-lt — so applying
+//! them to the slightly different LT areas we compute is approximate by construction.
+//! On crambin the solvent term and total contact area match a `voronota-voromqa` run
+//! to <0.5%, but the absolute pseudo-energy does not. That is fine for the
+//! *native-referenced* ΔE used to reweight conformations (the offset largely
+//! cancels); our absolute score is not directly comparable to canonical VoroMQA.
+//!
 //! The `e(...)` weights are dimensionless log-odds, so the energy is in arbitrary
 //! units (area, Å², times a statistical weight), **not** kJ/mol. It is meaningful
 //! only as *differences* between conformations, and for MC reweighting carries one
