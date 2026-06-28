@@ -1,6 +1,7 @@
 //! The `elasticrab` command-line tool: read a structure, run rigid-block NMA, and
-//! animate the lowest modes into PDB/XTC trajectories. Interface modelled on
-//! NOLB but with idiomatic names and 1-indexed (rigid-body-free) modes.
+//! either `animate` the lowest modes, morph toward a target (`transition`), or build a
+//! Monte-Carlo `energy` table — one named subcommand each, over a shared set of
+//! network/solve options. 1-indexed, rigid-body-free modes.
 
 mod io;
 mod voromqa;
@@ -28,151 +29,137 @@ const DEFAULT_GAMMA: f64 = 11.5;
 /// (kJ/mol, via γ), so the Boltzmann factor uses RT, not the per-particle kT.
 const GAS_CONSTANT_KJ_PER_MOL_K: f64 = 8.314_462_618e-3;
 
-/// Normal-mode analysis: animate a protein's softest vibrational modes.
-///
-/// Reads a PDB or mmCIF structure, builds a mass-weighted rigid-block elastic
-/// network, and writes a multi-model PDB (or XTC) trajectory per mode.
+/// Normal-mode analysis of a protein: animate modes, morph toward a target, or
+/// build a Monte-Carlo energy table — one named subcommand each.
 #[derive(Parser)]
-#[command(name = "elasticrab", version, about, long_about = None)]
+#[command(
+    name = "elasticrab",
+    version,
+    about,
+    long_about = None,
+    subcommand_required = true,
+    arg_required_else_help = true
+)]
 struct Cli {
+    /// The network/solve options shared by every verb — shown here at the top level,
+    /// so each `<verb> --help` lists only that verb's own options.
+    #[command(flatten)]
+    solve: SolveArgs,
+    #[command(subcommand)]
+    command: Command,
+}
+
+/// The network + solve options every verb shares (mass-weighted rigid-block NMA).
+#[derive(clap::Args)]
+struct SolveArgs {
     /// Input structure (PDB or mmCIF; format auto-detected).
+    #[arg(short = 'i', long, value_name = "PATH")]
     input: PathBuf,
 
     /// Spring interaction cutoff, in ångström.
-    #[arg(short, long, default_value_t = 5.0, value_name = "ANGSTROM")]
+    #[arg(short = 'c', long, default_value_t = 5.0, value_name = "ANGSTROM")]
     cutoff: f64,
 
-    /// Build springs from a Voronoi tessellation (contact-area weighted).
-    ///
-    /// Mutually exclusive with --cutoff.
+    /// Build springs from a Voronoi tessellation (contact-area weighted). Mutually
+    /// exclusive with --cutoff.
     #[arg(long, conflicts_with = "cutoff")]
     voronota: bool,
 
-    /// Animate the N lowest modes (1 = softest).
-    ///
-    /// Ignored when --mode is given.
-    #[arg(short = 'n', long, default_value_t = 1, value_name = "N")]
+    /// The N lowest modes (1 = softest).
+    #[arg(short = 'n', long = "modes", default_value_t = 1, value_name = "N")]
     modes: usize,
-
-    /// Specific mode to animate (1 = softest); repeatable.
-    #[arg(long = "mode", value_name = "INDEX")]
-    mode: Vec<usize>,
 
     /// Frames per trajectory (0 = report only).
     #[arg(short = 's', long, default_value_t = 20, value_name = "N")]
     frames: usize,
 
-    /// Peak displacement RMSD, in ångström.
-    #[arg(short = 'a', long, default_value_t = 1.5, value_name = "RMSD")]
-    amplitude: f64,
-
-    /// Use linear displacement, not the nonlinear default.
-    ///
-    /// Straight-line motion stretches bonds; nonlinear keeps them rigid.
+    /// Use linear displacement, not the nonlinear default (which keeps bonds rigid).
     #[arg(long)]
     linear: bool,
 
-    /// Include HETATM records (ligands, ions).
-    ///
-    /// Waters (HOH) are always dropped by the parser.
+    /// Include HETATM records (ligands, ions). Waters (HOH) are always dropped.
     #[arg(long)]
     hetatm: bool,
 
-    /// Keep only atoms matching a VMD-like selection.
-    ///
-    /// For example, "chain A and name CA".
+    /// Keep only atoms matching a VMD-like selection, e.g. "chain A and name CA".
     #[arg(long, value_name = "EXPR")]
     select: Option<String>,
 
     /// Trajectory output path; format by `.pdb`/`.xtc` extension.
-    ///
-    /// Defaults to `<input>_mode<k>.pdb`, one file per mode.
-    #[arg(short, long, value_name = "PATH")]
+    #[arg(short = 'o', long, value_name = "PATH")]
     output: Option<PathBuf>,
 
     /// Write the report as JSON to this file.
     #[arg(long, value_name = "FILE")]
     json: Option<PathBuf>,
 
-    /// Merge modes into one trajectory + an MC energy CSV.
-    ///
-    /// Each mode is sampled at thermal amplitudes (±--sigmas σ), not --amplitude.
-    ///
-    /// Columns: frame, mode, rmsd, energy (γ=1, Å²), energy_kJ_mol, weight.
-    #[arg(long, value_name = "FILE")]
-    energy: Option<PathBuf>,
-
-    /// Morph the structure toward a target conformation (PDB/mmCIF) along the
-    /// lowest --modes modes, NOLB's structure-to-structure transition.
-    ///
-    /// Projects the native→target motion onto the modes and writes the morph
-    /// trajectory to --output (nonlinear unless --linear). The target must have the
-    /// same atoms in the same order. Reports each mode's overlap and the RMSD
-    /// reduction. Pass `-n 10` (default 1) to fit with more modes.
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["energy", "mode"])]
-    target: Option<PathBuf>,
-
-    /// Re-diagonalize the network N times along the transition (NOLB's --nIter), for
-    /// large changes where the modes drift as the structure deforms. 0 (default) is a
-    /// single nonlinear morph; NOLB recommends 5. Each --frames step re-solves and
-    /// re-projects the remaining gap.
-    #[arg(
-        long = "n-iter",
-        value_name = "N",
-        default_value_t = 0,
-        requires = "target",
-        conflicts_with = "linear"
-    )]
-    n_iter: usize,
-
-    /// Use the VoroMQA contact-area energy for the --energy table, in place of the
-    /// elastic spring energy.
-    ///
-    /// A knowledge-based score (bundled v1 potential), re-tessellated per frame. The
-    /// energy column is referenced to the native frame and scaled by --gamma (a
-    /// tuning knob with the right units — tune it for VoroMQA), so energy_kJ_mol and
-    /// weight follow exactly as for the spring energy.
-    #[arg(long, requires = "energy")]
-    voromqa: bool,
-
-    /// Like --voromqa, but with a potential file you supply (e.g. another VoroMQA
-    /// revision). Mutually exclusive with --voromqa.
-    #[arg(
-        long,
-        value_name = "FILE",
-        conflicts_with = "voromqa",
-        requires = "energy"
-    )]
-    voromqa_file: Option<PathBuf>,
-
-    /// Energy scale γ (kJ/mol/Å²) — the spring constant and the --energy table's
-    /// shared scale.
-    ///
-    /// Scales the energy_kJ_mol/weight columns for whichever scheme is active
-    /// (elastic, or VoroMQA with --voromqa). The default is B-factor-fitted for the
-    /// spring; tune it for VoroMQA.
+    /// Energy scale γ (kJ/mol/Å²) — the spring constant and the energy-table scale.
+    /// The default is B-factor-fitted for the spring; tune it for VoroMQA.
     #[arg(short = 'g', long, default_value_t = DEFAULT_GAMMA, value_name = "VALUE")]
     gamma: f64,
 
-    /// Temperature, in kelvin.
-    ///
-    /// Sets the fluctuations and the Boltzmann weights.
+    /// Temperature, in kelvin. Sets the fluctuations and the Boltzmann weights.
     #[arg(short = 'T', long, default_value_t = 298.15, value_name = "KELVIN")]
     temperature: f64,
 
-    /// Fit γ to the input's B-factors; overrides --gamma.
-    ///
-    /// Runs a dense all-atom solve (memory-heavy for very large structures); on
-    /// failure it warns and falls back to --gamma.
+    /// Fit γ to the input's B-factors; overrides --gamma. Runs a dense all-atom solve;
+    /// on failure it warns and falls back to --gamma.
     #[arg(long)]
     b_factor_fit: bool,
+}
 
-    /// Thermal sampling width for --energy, in σ.
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Animate the lowest modes into PDB/XTC trajectories.
+    Animate {
+        /// Specific mode to animate (1 = softest); repeatable. Overrides -n.
+        #[arg(long = "mode", value_name = "INDEX")]
+        mode: Vec<usize>,
+        /// Peak displacement RMSD, in ångström.
+        #[arg(short = 'a', long, default_value_t = 1.5, value_name = "RMSD")]
+        amplitude: f64,
+    },
+
+    /// Morph the structure toward a target conformation (NOLB's transition).
     ///
-    /// Each mode is swept over ±N·σ of its own thermal fluctuation, so the pool
-    /// is Boltzmann-relevant (peak energy ≈ ½N²·RT).
-    #[arg(long, default_value_t = 3.0, value_name = "N")]
-    sigmas: f64,
+    /// Projects the native→target motion onto the lowest -n modes and writes the morph
+    /// (nonlinear unless --linear). The target must have the same atoms in the same order.
+    #[command(arg_required_else_help = true)]
+    Transition {
+        /// Target conformation (PDB/mmCIF).
+        #[arg(long, value_name = "PATH")]
+        target: PathBuf,
+        /// Re-diagonalize the network N times along the path (NOLB's --nIter), for large
+        /// changes where the modes drift. 0 (default) is a single nonlinear morph; NOLB
+        /// recommends 5. Not available with --linear or --voronota.
+        #[arg(long = "n-iter", default_value_t = 0, value_name = "N")]
+        n_iter: usize,
+    },
+
+    /// Per-frame Monte-Carlo energy table over a thermally-sampled pool.
+    ///
+    /// Columns: frame, mode, rmsd, energy (γ=1, Å²), energy_kJ_mol, weight — each mode
+    /// swept over ±--sigmas of its thermal width.
+    #[command(arg_required_else_help = true)]
+    Energy {
+        /// Output energy-table CSV path.
+        #[arg(long, value_name = "PATH")]
+        csv: PathBuf,
+        /// Sample specific modes (1 = softest); repeatable. Overrides -n.
+        #[arg(long = "mode", value_name = "INDEX")]
+        mode: Vec<usize>,
+        /// Thermal sampling width, in σ.
+        #[arg(long, default_value_t = 3.0, value_name = "N")]
+        sigmas: f64,
+        /// Use the VoroMQA contact-area energy in place of the elastic spring energy
+        /// (bundled v1 potential, re-tessellated per frame, scaled by --gamma).
+        #[arg(long)]
+        voromqa: bool,
+        /// Like --voromqa, but with a potential file you supply. Mutually exclusive
+        /// with --voromqa.
+        #[arg(long, value_name = "FILE", conflicts_with = "voromqa")]
+        voromqa_file: Option<PathBuf>,
+    },
 }
 
 /// Entry point: set up diagnostics, parse arguments, run, and turn any error into
@@ -189,28 +176,65 @@ pub fn run() -> ExitCode {
 }
 
 fn execute(cli: &Cli) -> Result<(), String> {
+    let solve = &cli.solve;
+    match &cli.command {
+        Command::Animate { mode, amplitude } => run_animate(solve, mode, *amplitude),
+        Command::Transition { target, n_iter } => run_transition(solve, target, *n_iter),
+        Command::Energy {
+            csv,
+            mode,
+            sigmas,
+            voromqa,
+            voromqa_file,
+        } => run_energy(solve, csv, mode, *sigmas, *voromqa, voromqa_file.as_deref()),
+    }
+}
+
+/// The parsed structure and built network inputs every verb needs, before the solve.
+struct Prepared {
+    records: Vec<AtomRecord>,
+    positions: Vec<[f64; 3]>,
+    atoms: Vec<Atom>,
+    blocks: Vec<usize>,
+    springs: Option<Vec<Spring>>,
+    radii: RadiiLookup,
+}
+
+/// The HETATM/selection parse options for a run.
+fn parse_options(solve: &SolveArgs) -> ParseOptions {
+    ParseOptions {
+        exclude_heteroatoms: !solve.hetatm,
+        ..Default::default()
+    }
+}
+
+/// Reject a non-finite or non-positive numeric option, with a uniform message.
+fn require_positive(name: &str, value: f64) -> Result<(), String> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!("{name} must be a positive number (got {value})"));
+    }
+    Ok(())
+}
+
+/// Validate the shared options, parse + `--select` the input, and build the network
+/// inputs (positions, atoms, residue blocks, tessellation springs) — the prelude every
+/// verb runs. The solve is left to each verb (the iterative transition skips it).
+fn prepare(solve: &SolveArgs) -> Result<Prepared, String> {
     for (name, value) in [
-        ("--cutoff", cli.cutoff),
-        ("--gamma", cli.gamma),
-        ("--temperature", cli.temperature),
-        ("--sigmas", cli.sigmas),
+        ("--cutoff", solve.cutoff),
+        ("--gamma", solve.gamma),
+        ("--temperature", solve.temperature),
     ] {
-        if !value.is_finite() || value <= 0.0 {
-            return Err(format!("{name} must be a positive number (got {value})"));
-        }
+        require_positive(name, value)?;
     }
 
-    let options = ParseOptions {
-        exclude_heteroatoms: !cli.hetatm,
-        ..Default::default()
-    };
+    let options = parse_options(solve);
     // One radii table, shared by the parser and the tessellation (--voronota).
     let radii = RadiiLookup::new();
-    let parsed = parse_file_with_records(&cli.input, &options, &radii)
-        .map_err(|e| format!("reading {}: {e}", cli.input.display()))?;
+    let parsed = parse_file_with_records(&solve.input, &options, &radii)
+        .map_err(|e| format!("reading {}: {e}", solve.input.display()))?;
     let mut records = parsed.records;
-
-    if let Some(expr) = &cli.select {
+    if let Some(expr) = &solve.select {
         let selection =
             Selection::parse(expr).map_err(|e| format!("invalid selection {expr:?}: {e}"))?;
         records.retain(|r| selection.matches(r));
@@ -235,47 +259,46 @@ fn execute(cli: &Cli) -> Result<(), String> {
         .iter()
         .map(|&g| g as usize)
         .collect();
-
-    // Tessellation springs (when --voronota); otherwise the distance cutoff is used.
-    let springs = cli
+    let springs = solve
         .voronota
         .then(|| voronota_springs(&records, &radii))
         .transpose()?;
 
-    // Optional VoroMQA scorer for the --energy table (bundled v1, or a given file),
-    // built before the solve so a malformed --voromqa-file fails fast.
-    let voromqa = match (cli.voromqa, &cli.voromqa_file) {
-        (true, _) => Some(voromqa::Potential::bundled()),
-        (false, Some(path)) => Some(voromqa::Potential::load(path)?),
-        (false, None) => None,
-    };
+    Ok(Prepared {
+        records,
+        positions,
+        atoms,
+        blocks,
+        springs,
+        radii,
+    })
+}
 
-    let wanted = wanted_modes(cli)?;
-    let k = *wanted.iter().max().expect("wanted is non-empty");
-
-    // Parse the target up front (when given): a bad target then fails fast, and the
-    // iterative path can dispatch *before* the native solve below — which it would
-    // otherwise redo as its own first iteration.
-    let target = cli
-        .target
-        .as_deref()
-        .map(|path| parse_target(cli, &options, &radii, positions.len(), path).map(|t| (path, t)))
-        .transpose()?;
-    if cli.n_iter > 0 {
-        let (path, target) = target.expect("--n-iter requires --target (enforced by clap)");
-        return run_iterative_transition(cli, &positions, &records, &blocks, k, path, &target);
-    }
-
-    let modes = with_connectivity(
-        NormalModes::builder(&atoms)
+/// Solve the mass-weighted rigid-block modes (lowest `k`) for the prepared network.
+fn solve_modes(solve: &SolveArgs, prep: &Prepared, k: usize) -> Result<NormalModes, String> {
+    with_connectivity(
+        NormalModes::builder(&prep.atoms)
             .mass_weighted()
             .k_modes(k)
-            .blocks(&blocks),
-        cli.cutoff,
-        springs.as_deref(),
+            .blocks(&prep.blocks),
+        solve.cutoff,
+        prep.springs.as_deref(),
     )
     .solve()
-    .map_err(|e| format!("normal-mode analysis failed: {e}"))?;
+    .map_err(|e| format!("normal-mode analysis failed: {e}"))
+}
+
+/// The shared `animate`/`energy` prelude: solve the requested modes (rejecting any
+/// beyond the spectrum), then print the spectrum report. Returns the modes, the
+/// 1-indexed set the user asked for, and the effective γ.
+fn solve_and_report(
+    solve: &SolveArgs,
+    prep: &Prepared,
+    mode: &[usize],
+) -> Result<(NormalModes, Vec<usize>, f64), String> {
+    let wanted = wanted_modes(solve.modes, mode)?;
+    let k = *wanted.iter().max().expect("wanted is non-empty");
+    let modes = solve_modes(solve, prep, k)?;
     for &m in &wanted {
         if m > modes.len() {
             return Err(format!(
@@ -284,39 +307,70 @@ fn execute(cli: &Cli) -> Result<(), String> {
             ));
         }
     }
+    let (gamma, fit_r) =
+        effective_gamma(solve, &prep.atoms, &prep.records, prep.springs.as_deref())?;
+    report(solve, &prep.records, &prep.blocks, &modes, gamma, fit_r)?;
+    Ok((modes, wanted, gamma))
+}
 
-    // A target conformation takes its own path: project native→target onto the
-    // modes and write the morph, instead of the per-mode animation or energy table.
-    if let Some((target_path, target)) = target {
-        return run_transition(cli, &positions, &records, &modes, target_path, &target);
-    }
+/// `animate`: the spectrum report plus a PDB/XTC trajectory per requested mode.
+fn run_animate(solve: &SolveArgs, mode: &[usize], amplitude: f64) -> Result<(), String> {
+    let prep = prepare(solve)?;
+    let (modes, wanted, _gamma) = solve_and_report(solve, &prep, mode)?;
 
-    let (gamma, fit_r) = effective_gamma(cli, &atoms, &records, springs.as_deref())?;
-    report(cli, &records, &blocks, &modes, gamma, fit_r)?;
-
-    if let Some(csv) = cli.energy.as_deref() {
-        write_merged(
-            cli,
-            &modes,
-            &positions,
-            &records,
-            &wanted,
-            csv,
-            gamma,
-            voromqa.as_ref(),
-            &radii,
-        )?;
-    } else if cli.frames > 0 {
+    if solve.frames > 0 {
         let multi = wanted.len() > 1;
         for &m in &wanted {
-            let path = output_path(cli.output.as_deref(), &cli.input, m, multi);
-            guard_input(&path, &cli.input)?;
-            let frames = animate(&modes, &positions, m, cli.amplitude, cli.frames, cli.linear)?;
-            write_trajectory(&path, &records, &frames)?;
+            let path = output_path(solve.output.as_deref(), &solve.input, m, multi);
+            guard_input(&path, &solve.input)?;
+            let frames = animate(
+                &modes,
+                &prep.positions,
+                m,
+                amplitude,
+                solve.frames,
+                solve.linear,
+            )?;
+            write_trajectory(&path, &prep.records, &frames)?;
             println!("  wrote {}", path.display());
         }
     }
     Ok(())
+}
+
+/// `energy`: the spectrum report plus the merged MC trajectory and energy table.
+fn run_energy(
+    solve: &SolveArgs,
+    csv: &Path,
+    mode: &[usize],
+    sigmas: f64,
+    voromqa: bool,
+    voromqa_file: Option<&Path>,
+) -> Result<(), String> {
+    // Cheap rejections before the (possibly two) eigensolves.
+    if solve.frames == 0 {
+        return Err("energy needs --frames greater than 0 (nothing to score otherwise)".into());
+    }
+    require_positive("--sigmas", sigmas)?;
+
+    let prep = prepare(solve)?;
+    // Build the scorer before the solve so a malformed --voromqa-file fails fast.
+    let potential = match (voromqa, voromqa_file) {
+        (true, _) => Some(voromqa::Potential::bundled()),
+        (false, Some(path)) => Some(voromqa::Potential::load(path)?),
+        (false, None) => None,
+    };
+    let (modes, wanted, gamma) = solve_and_report(solve, &prep, mode)?;
+    write_merged(
+        solve,
+        &modes,
+        &prep,
+        &wanted,
+        csv,
+        gamma,
+        sigmas,
+        potential.as_ref(),
+    )
 }
 
 /// `--energy`: merge the native frame plus every mode's frames into one
@@ -327,27 +381,27 @@ fn execute(cli: &Cli) -> Result<(), String> {
 // rather than rebuilt, so a context struct would obscure more than it tidies.
 #[allow(clippy::too_many_arguments)]
 fn write_merged(
-    cli: &Cli,
+    solve: &SolveArgs,
     modes: &NormalModes,
-    positions: &[[f64; 3]],
-    records: &[AtomRecord],
+    prep: &Prepared,
     wanted: &[usize],
     csv: &Path,
     gamma: f64,
+    sigmas: f64,
     voromqa: Option<&voromqa::Potential>,
-    radii: &RadiiLookup,
 ) -> Result<(), String> {
-    if cli.frames == 0 {
-        return Err("--energy needs --frames greater than 0 (nothing to score otherwise)".into());
-    }
+    let positions: &[[f64; 3]] = &prep.positions;
+    let records: &[AtomRecord] = &prep.records;
+    let radii = &prep.radii;
+    // (`run_energy` has already rejected `--frames 0` before the solve.)
     // Resolve and check every output path before animating, so a clobbering
     // mistake fails fast and never destroys the input or one output with another.
-    let traj = cli.output.as_deref().map_or_else(
-        || with_stem(&cli.input, |stem| format!("{stem}_modes.pdb")),
+    let traj = solve.output.as_deref().map_or_else(
+        || with_stem(&solve.input, |stem| format!("{stem}_modes.pdb")),
         Path::to_path_buf,
     );
-    guard_input(&traj, &cli.input)?;
-    guard_input(csv, &cli.input)?;
+    guard_input(&traj, &solve.input)?;
+    guard_input(csv, &solve.input)?;
     if same_path(csv, &traj) {
         return Err(format!(
             "the energy table and the trajectory cannot be the same file ({})",
@@ -384,7 +438,7 @@ fn write_merged(
     // energy relative to the native (native ⇒ 0 ⇒ weight 1). γ is the shared scale
     // (a tuning knob with the right units) for whichever scheme is active; RT (not
     // kT) because E is molar.
-    let rt = GAS_CONSTANT_KJ_PER_MOL_K * cli.temperature;
+    let rt = GAS_CONSTANT_KJ_PER_MOL_K * solve.temperature;
     let row = |frame, mode, rmsd, energy: f64| {
         let energy_kj = gamma * energy;
         io::EnergyRow {
@@ -401,7 +455,7 @@ fn write_merged(
     let mut frames = vec![positions.to_vec()];
     let mut rows = vec![row(0, 0, 0.0, 0.0)];
     for &m in wanted {
-        for frame in thermal_frames(modes, positions, m, gamma, cli)? {
+        for frame in thermal_frames(modes, positions, m, gamma, solve, sigmas)? {
             let energy = frame_energy(&frame) - native_energy;
             rows.push(row(
                 frames.len(),
@@ -485,23 +539,26 @@ fn voronota_springs(records: &[AtomRecord], radii: &RadiiLookup) -> Result<Vec<S
 /// The γ for the energy/weight columns and report: fitted from B-factors when
 /// `--b-factor-fit` is set (returning its correlation too), else `--gamma`.
 fn effective_gamma(
-    cli: &Cli,
+    solve: &SolveArgs,
     atoms: &[Atom],
     records: &[AtomRecord],
     springs: Option<&[Spring]>,
 ) -> Result<(f64, Option<f64>), String> {
-    if cli.b_factor_fit {
-        match fit_gamma(cli, atoms, records, springs) {
+    if solve.b_factor_fit {
+        match fit_gamma(solve, atoms, records, springs) {
             Ok((gamma, r)) => Ok((gamma, Some(r))),
             // A failed fit shouldn't suppress the report and trajectory the user
             // also asked for; warn and fall back to the manual γ.
             Err(message) => {
-                eprintln!("warning: {message}; falling back to --gamma {}", cli.gamma);
-                Ok((cli.gamma, None))
+                eprintln!(
+                    "warning: {message}; falling back to --gamma {}",
+                    solve.gamma
+                );
+                Ok((solve.gamma, None))
             }
         }
     } else {
-        Ok((cli.gamma, None))
+        Ok((solve.gamma, None))
     }
 }
 
@@ -510,12 +567,12 @@ fn effective_gamma(
 /// the correct, mass-independent configurational-fluctuation model — and the
 /// through-origin least-squares `γ = Σ B₁² / Σ B₁·B^exp` (since `B ∝ 1/γ`).
 fn fit_gamma(
-    cli: &Cli,
+    solve: &SolveArgs,
     atoms: &[Atom],
     records: &[AtomRecord],
     springs: Option<&[Spring]>,
 ) -> Result<(f64, f64), String> {
-    let modes = with_connectivity(NormalModes::builder(atoms), cli.cutoff, springs)
+    let modes = with_connectivity(NormalModes::builder(atoms), solve.cutoff, springs)
         .solve()
         .map_err(|e| format!("--b-factor-fit: {e}"))?;
 
@@ -523,7 +580,7 @@ fn fit_gamma(
     // (non-zero prediction) that actually carry a B-factor.
     let (mut predicted, mut experimental) = (Vec::new(), Vec::new());
     for (b_pred, record) in modes
-        .predicted_b_factors(cli.temperature)
+        .predicted_b_factors(solve.temperature)
         .iter()
         .zip(records)
     {
@@ -564,11 +621,11 @@ fn pearson(x: &[f64], y: &[f64]) -> f64 {
 }
 
 /// The 1-indexed modes to animate: `--mode` if given, otherwise `1..=modes`.
-fn wanted_modes(cli: &Cli) -> Result<Vec<usize>, String> {
-    let wanted = if cli.mode.is_empty() {
-        (1..=cli.modes).collect::<Vec<_>>()
+fn wanted_modes(modes: usize, mode: &[usize]) -> Result<Vec<usize>, String> {
+    let wanted = if mode.is_empty() {
+        (1..=modes).collect::<Vec<_>>()
     } else {
-        cli.mode.clone()
+        mode.to_vec()
     };
     if wanted.is_empty() {
         return Err("no modes requested (use -n >= 1 or --mode)".into());
@@ -640,17 +697,18 @@ fn thermal_frames(
     positions: &[[f64; 3]],
     mode: usize,
     gamma: f64,
-    cli: &Cli,
+    solve: &SolveArgs,
+    sigmas: f64,
 ) -> Result<Vec<Vec<[f64; 3]>>, String> {
-    let unit_energy = modes.energy(&displace_at(modes, positions, mode, 1.0, cli.linear)?);
+    let unit_energy = modes.energy(&displace_at(modes, positions, mode, 1.0, solve.linear)?);
     if !unit_energy.is_finite() || unit_energy <= 0.0 {
         return Err(format!(
             "mode {mode} has no restoring energy to sample thermally"
         ));
     }
-    let rt = GAS_CONSTANT_KJ_PER_MOL_K * cli.temperature;
-    let peak = cli.sigmas * (rt / (2.0 * gamma * unit_energy)).sqrt();
-    sweep(modes, positions, mode, peak, cli.frames, cli.linear)
+    let rt = GAS_CONSTANT_KJ_PER_MOL_K * solve.temperature;
+    let peak = sigmas * (rt / (2.0 * gamma * unit_energy)).sqrt();
+    sweep(modes, positions, mode, peak, solve.frames, solve.linear)
 }
 
 fn rms_deviation(a: &[[f64; 3]], b: &[[f64; 3]]) -> f64 {
@@ -725,16 +783,16 @@ fn file_stem(path: &Path) -> String {
 /// `--select`), returning its coordinates. A count mismatch is an error — aligning
 /// differing structures is not yet supported.
 fn parse_target(
-    cli: &Cli,
-    options: &ParseOptions,
+    solve: &SolveArgs,
     radii: &RadiiLookup,
     native_len: usize,
     target_path: &Path,
 ) -> Result<Vec<[f64; 3]>, String> {
-    let parsed = parse_file_with_records(target_path, options, radii)
+    let options = parse_options(solve);
+    let parsed = parse_file_with_records(target_path, &options, radii)
         .map_err(|e| format!("reading {}: {e}", target_path.display()))?;
     let mut target_records = parsed.records;
-    if let Some(expr) = &cli.select {
+    if let Some(expr) = &solve.select {
         let selection =
             Selection::parse(expr).map_err(|e| format!("invalid selection {expr:?}: {e}"))?;
         target_records.retain(|r| selection.matches(r));
@@ -753,46 +811,73 @@ fn parse_target(
 
 /// The morph trajectory path (`--output`, else `<input>_morph.pdb`), guarded against
 /// overwriting the input.
-fn morph_output_path(cli: &Cli) -> Result<PathBuf, String> {
-    let path = match cli.output.as_deref() {
+fn morph_output_path(solve: &SolveArgs) -> Result<PathBuf, String> {
+    let path = match solve.output.as_deref() {
         Some(p) => p.to_path_buf(),
-        None => with_stem(&cli.input, |stem| format!("{stem}_morph.pdb")),
+        None => with_stem(&solve.input, |stem| format!("{stem}_morph.pdb")),
     };
-    guard_input(&path, &cli.input)?;
+    guard_input(&path, &solve.input)?;
     Ok(path)
 }
 
-/// The single-shot transition: project the native→target motion onto the pre-solved
-/// modes, report it, and write the morph.
-fn run_transition(
-    cli: &Cli,
-    native: &[[f64; 3]],
-    records: &[AtomRecord],
-    modes: &NormalModes,
-    target_path: &Path,
-    target: &[[f64; 3]],
-) -> Result<(), String> {
-    let transition = modes
-        .transition(native, target)
-        .map_err(|e| format!("transition failed: {e}"))?;
-    report_transition(cli, target_path, &transition)?;
+/// `transition`: project the native→target motion onto the lowest -n modes, report it,
+/// and write the morph — or the iterative re-diagonalizing path when `n_iter > 0`.
+fn run_transition(solve: &SolveArgs, target_path: &Path, n_iter: usize) -> Result<(), String> {
+    let k = solve.modes;
+    if k == 0 {
+        return Err("no modes requested (use -n >= 1)".into());
+    }
+    // Reject the incompatible iterative-path flags up front, before any parsing or solve.
+    if n_iter > 0 {
+        if solve.linear {
+            return Err("--n-iter is not compatible with --linear (the iterative \
+                        transition is nonlinear)"
+                .into());
+        }
+        if solve.voronota {
+            return Err(
+                "--n-iter is not supported with --voronota (re-tessellating the \
+                        network along the path is not yet implemented); use the distance cutoff"
+                    .into(),
+            );
+        }
+    }
 
-    if cli.frames > 0 {
-        let path = morph_output_path(cli)?;
+    let prep = prepare(solve)?;
+    let target = parse_target(solve, &prep.radii, prep.positions.len(), target_path)?;
+
+    if n_iter > 0 {
+        return run_iterative_transition(solve, &prep, &target, target_path, k, n_iter);
+    }
+
+    let modes = solve_modes(solve, &prep, k)?;
+    if k > modes.len() {
+        return Err(format!(
+            "{k} modes requested but only {} non-zero modes exist",
+            modes.len()
+        ));
+    }
+    let transition = modes
+        .transition(&prep.positions, &target)
+        .map_err(|e| format!("transition failed: {e}"))?;
+    report_transition(solve, target_path, &transition)?;
+
+    if solve.frames > 0 {
+        let path = morph_output_path(solve)?;
         let frames = transition
-            .morph(cli.frames, !cli.linear)
+            .morph(solve.frames, !solve.linear)
             .map_err(|e| format!("morph failed: {e}"))?;
         // The actual endpoint of the written trajectory — for a nonlinear morph this
         // differs from the linear-fit residual the report prints.
         let endpoint = frames
             .last()
             .map_or(0.0, |frame| transition.rmsd_to_target(frame));
-        write_trajectory(&path, records, &frames)?;
+        write_trajectory(&path, &prep.records, &frames)?;
         println!(
             "  wrote {} ({} frames, {}, endpoint RMSD {endpoint:.4} Å)",
             path.display(),
             frames.len(),
-            if cli.linear { "linear" } else { "nonlinear" }
+            if solve.linear { "linear" } else { "nonlinear" }
         );
     }
     Ok(())
@@ -803,21 +888,14 @@ fn run_transition(
 /// to the distance-cutoff network — a Voronoi network would need re-tessellating along
 /// the path.
 fn run_iterative_transition(
-    cli: &Cli,
-    native: &[[f64; 3]],
-    records: &[AtomRecord],
-    blocks: &[usize],
-    k: usize,
-    target_path: &Path,
+    solve: &SolveArgs,
+    prep: &Prepared,
     target: &[[f64; 3]],
+    target_path: &Path,
+    k: usize,
+    n_iter: usize,
 ) -> Result<(), String> {
-    if cli.voronota {
-        return Err(
-            "--n-iter is not supported with --voronota (re-tessellating the \
-                    network along the path is not yet implemented); use the distance cutoff"
-                .to_string(),
-        );
-    }
+    // (--voronota / --linear incompatibility is rejected up front in `run_transition`.)
     if k == 1 {
         // The whole point is a multi-mode morph; one mode barely moves the structure.
         eprintln!(
@@ -827,36 +905,44 @@ fn run_iterative_transition(
     }
     // The closure is the whole build config the re-solve needs: new positions, the
     // original masses, the same cutoff and rigid blocks, rebuilt every iteration.
-    let masses: Vec<f64> = records
+    let masses: Vec<f64> = prep
+        .records
         .iter()
         .map(|r| io::element_mass(&r.element))
         .collect();
-    let cutoff = cli.cutoff;
-    let result = transition_iterative(native, target, cli.n_iter, cli.frames.max(1), |positions| {
-        let atoms: Vec<Atom> = positions
-            .iter()
-            .zip(&masses)
-            .map(|(&position, &mass)| Atom { position, mass })
-            .collect();
-        NormalModes::builder(&atoms)
-            .cutoff(cutoff)
-            .blocks(blocks)
-            .mass_weighted()
-            .k_modes(k)
-            .solve()
-    })
+    let cutoff = solve.cutoff;
+    let blocks = &prep.blocks;
+    let result = transition_iterative(
+        &prep.positions,
+        target,
+        n_iter,
+        solve.frames.max(1),
+        |positions| {
+            let atoms: Vec<Atom> = positions
+                .iter()
+                .zip(&masses)
+                .map(|(&position, &mass)| Atom { position, mass })
+                .collect();
+            NormalModes::builder(&atoms)
+                .cutoff(cutoff)
+                .blocks(blocks)
+                .mass_weighted()
+                .k_modes(k)
+                .solve()
+        },
+    )
     .map_err(|e| format!("iterative transition failed: {e}"))?;
 
-    report_iterative(cli, target_path, &result)?;
+    report_iterative(solve, n_iter, target_path, &result)?;
 
-    if cli.frames > 0 {
-        let path = morph_output_path(cli)?;
-        write_trajectory(&path, records, result.frames())?;
+    if solve.frames > 0 {
+        let path = morph_output_path(solve)?;
+        write_trajectory(&path, &prep.records, result.frames())?;
         println!(
             "  wrote {} ({} frames, nonlinear, {} re-diagonalization(s), endpoint RMSD {:.4} Å)",
             path.display(),
             result.frames().len(),
-            cli.n_iter,
+            n_iter,
             result.final_rmsd()
         );
     }
@@ -865,16 +951,18 @@ fn run_iterative_transition(
 
 /// The iterative-transition report: the rigid-body-aligned RMSD to the target after
 /// each re-diagonalization (NOLB's "RMSD statistics").
-fn report_iterative(cli: &Cli, target: &Path, result: &IterativeTransition) -> Result<(), String> {
+fn report_iterative(
+    solve: &SolveArgs,
+    n_iter: usize,
+    target: &Path,
+    result: &IterativeTransition,
+) -> Result<(), String> {
     println!(
         "elasticrab — {} → {}",
-        cli.input.display(),
+        solve.input.display(),
         target.display()
     );
-    println!(
-        "  iterative nonlinear transition, {} re-diagonalization(s)",
-        cli.n_iter
-    );
+    println!("  iterative nonlinear transition, {n_iter} re-diagonalization(s)");
     println!("  diag  RMSD (Å)");
     for (i, &r) in result.step_rmsds().iter().enumerate() {
         println!("  {i:>4}  {r:>8.4}");
@@ -885,8 +973,8 @@ fn report_iterative(cli: &Cli, target: &Path, result: &IterativeTransition) -> R
         result.final_rmsd()
     );
 
-    if let Some(path) = &cli.json {
-        let json = iterative_json(cli, target, result);
+    if let Some(path) = &solve.json {
+        let json = iterative_json(solve, n_iter, target, result);
         std::fs::write(path, json).map_err(|e| format!("writing {}: {e}", path.display()))?;
     }
     Ok(())
@@ -906,9 +994,14 @@ fn transition_json_header(input: &Path, target: &Path) -> String {
 }
 
 /// The iterative-transition report as a JSON object (numbers + the escaped paths).
-fn iterative_json(cli: &Cli, target: &Path, result: &IterativeTransition) -> String {
-    let mut s = transition_json_header(&cli.input, target);
-    let _ = writeln!(s, "  \"n_iter\": {},", cli.n_iter);
+fn iterative_json(
+    solve: &SolveArgs,
+    n_iter: usize,
+    target: &Path,
+    result: &IterativeTransition,
+) -> String {
+    let mut s = transition_json_header(&solve.input, target);
+    let _ = writeln!(s, "  \"n_iter\": {n_iter},");
     let _ = writeln!(s, "  \"initial_rmsd\": {},", result.initial_rmsd());
     let _ = writeln!(s, "  \"final_rmsd\": {},", result.final_rmsd());
     let rmsds: Vec<String> = result.step_rmsds().iter().map(f64::to_string).collect();
@@ -919,11 +1012,11 @@ fn iterative_json(cli: &Cli, target: &Path, result: &IterativeTransition) -> Str
 
 /// The transition report: per-mode overlap with the native→target motion, the
 /// running cumulative overlap, and the RMSD remaining after each mode.
-fn report_transition(cli: &Cli, target: &Path, t: &Transition<'_>) -> Result<(), String> {
+fn report_transition(solve: &SolveArgs, target: &Path, t: &Transition<'_>) -> Result<(), String> {
     let n = t.overlaps().len();
     println!(
         "elasticrab — {} → {}",
-        cli.input.display(),
+        solve.input.display(),
         target.display()
     );
     println!(
@@ -943,17 +1036,17 @@ fn report_transition(cli: &Cli, target: &Path, t: &Transition<'_>) -> Result<(),
     }
     println!("  best linear fit {:.4} Å", t.residual_rmsd(n));
 
-    if let Some(path) = &cli.json {
-        let json = transition_json(cli, target, t);
+    if let Some(path) = &solve.json {
+        let json = transition_json(solve, target, t);
         std::fs::write(path, json).map_err(|e| format!("writing {}: {e}", path.display()))?;
     }
     Ok(())
 }
 
 /// The transition report as a JSON object (hand-written, like [`report_json`]).
-fn transition_json(cli: &Cli, target: &Path, t: &Transition<'_>) -> String {
+fn transition_json(solve: &SolveArgs, target: &Path, t: &Transition<'_>) -> String {
     let n = t.overlaps().len();
-    let mut s = transition_json_header(&cli.input, target);
+    let mut s = transition_json_header(&solve.input, target);
     let _ = writeln!(s, "  \"initial_rmsd\": {},", t.initial_rmsd());
     let _ = writeln!(s, "  \"final_rmsd\": {},", t.residual_rmsd(n));
     s.push_str("  \"modes\": [\n");
@@ -973,7 +1066,7 @@ fn transition_json(cli: &Cli, target: &Path, t: &Transition<'_>) -> String {
 }
 
 fn report(
-    cli: &Cli,
+    solve: &SolveArgs,
     records: &[AtomRecord],
     blocks: &[usize],
     modes: &NormalModes,
@@ -983,13 +1076,13 @@ fn report(
     let residues = blocks.iter().copied().max().map_or(0, |m| m + 1);
     let frequencies: Vec<f64> = modes.eigenvalues().iter().map(|&l| l.sqrt()).collect();
 
-    println!("elasticrab — {}", cli.input.display());
+    println!("elasticrab — {}", solve.input.display());
     println!(
         "  atoms {}, residues {residues}, dropped {}",
         records.len(),
         modes.disconnected().len()
     );
-    if cli.voronota {
+    if solve.voronota {
         println!(
             "  Voronoi tessellation, {} springs, mass-weighted",
             modes.spring_count()
@@ -997,7 +1090,7 @@ fn report(
     } else {
         println!(
             "  cutoff {} Å, {} springs, mass-weighted",
-            cli.cutoff,
+            solve.cutoff,
             modes.spring_count()
         );
     }
@@ -1016,9 +1109,9 @@ fn report(
         );
     }
 
-    if let Some(path) = &cli.json {
+    if let Some(path) = &solve.json {
         let json = report_json(
-            cli,
+            solve,
             records.len(),
             residues,
             modes,
@@ -1034,7 +1127,7 @@ fn report(
 /// The report as a JSON object — all numeric/boolean but the (escaped) input
 /// path, so a hand-written writer avoids a `serde` dependency.
 fn report_json(
-    cli: &Cli,
+    solve: &SolveArgs,
     atoms: usize,
     residues: usize,
     modes: &NormalModes,
@@ -1047,17 +1140,17 @@ fn report_json(
     let _ = writeln!(
         s,
         "  \"input\": {},",
-        json_string(&cli.input.to_string_lossy())
+        json_string(&solve.input.to_string_lossy())
     );
     let _ = writeln!(s, "  \"atoms\": {atoms},");
     let _ = writeln!(s, "  \"residues\": {residues},");
     let _ = writeln!(s, "  \"dropped\": [{}],", dropped.join(", "));
     // `network` is always present as the discriminator; `cutoff` only when it applies.
-    if cli.voronota {
+    if solve.voronota {
         let _ = writeln!(s, "  \"network\": \"voronota\",");
     } else {
         let _ = writeln!(s, "  \"network\": \"cutoff\",");
-        let _ = writeln!(s, "  \"cutoff\": {},", cli.cutoff);
+        let _ = writeln!(s, "  \"cutoff\": {},", solve.cutoff);
     }
     let _ = writeln!(s, "  \"springs\": {},", modes.spring_count());
     let _ = writeln!(s, "  \"mass_weighted\": true,");

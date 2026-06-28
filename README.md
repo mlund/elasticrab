@@ -109,30 +109,34 @@ for PyMOL or VMD. Install it from the repository:
 cargo install --git https://github.com/mlund/elasticrab --features cli
 ```
 
-Then animate the softest modes of a structure (PDB or mmCIF):
+There are three subcommands — `animate`, `transition`, `energy`. The shared
+network/solve options (`-i/--input`, `-c`, `-n`, `-s`, `-o`, …) come **before** the
+verb; each verb adds only its own options after it:
 
 ```sh
-elasticrab protein.pdb -o mode1.pdb                       # softest mode, bond-preserving
-elasticrab protein.pdb -n 5 -o anim.xtc                   # five lowest modes -> anim_mode1.xtc …
-elasticrab protein.pdb --select "chain A" --json out.json # restrict atoms; structured report
-elasticrab protein.pdb -n 5 -o pool.xtc --energy e.csv    # merge modes + per-frame energies
-elasticrab protein.pdb --b-factor-fit --frames 0          # fit gamma to the input's B-factors
-elasticrab protein.pdb --target other.pdb -n 10 -o morph.pdb  # morph toward a target conformation
-elasticrab protein.pdb --voronota -o mode1.pdb            # area-weighted Voronoi springs, not a cutoff
-elasticrab protein.pdb -n 5 -o p.xtc --energy e.csv --voromqa  # VoroMQA energy, not spring
+elasticrab -i protein.pdb -o mode1.pdb animate                 # softest mode, bond-preserving
+elasticrab -i protein.pdb -n 5 -o anim.xtc animate            # five lowest modes -> anim_mode1.xtc …
+elasticrab -i protein.pdb --select "chain A" --json out.json animate  # restrict atoms; JSON report
+elasticrab -i protein.pdb --voronota -o mode1.pdb animate     # area-weighted Voronoi springs, not a cutoff
+elasticrab -i protein.pdb --b-factor-fit -s 0 animate         # fit gamma to the input's B-factors; report only
+
+elasticrab -i protein.pdb -n 10 -o morph.pdb transition --target other.pdb             # morph toward a target
+elasticrab -i protein.pdb -n 10 -o morph.pdb transition --target other.pdb --n-iter 5  # re-diagonalize along the path
+
+elasticrab -i protein.pdb -n 5 -o pool.xtc energy --csv e.csv            # merge modes + per-frame energies
+elasticrab -i protein.pdb -n 5 -o pool.xtc energy --csv e.csv --voromqa  # VoroMQA energy, not the spring energy
 ```
 
-It prints a frequency report to stdout (`--json` writes it to a file); run
-`elasticrab --help` for cutoff, amplitude, frame-count, and selection options.
-The interface is similar to NOLB.
+Each subcommand prints a report to stdout (`--json` writes it to a file). Run
+`elasticrab --help` to see the shared options and the verb list, or
+`elasticrab <verb> --help` for that verb's own options.
 
-`--energy` builds a Monte-Carlo conformation pool: it merges every requested mode
-into one trajectory (native frame first) and writes a
-`frame,mode,rmsd,energy,energy_kJ_mol,weight` table. Each mode is swept over
-±`--sigmas` σ (default 3) of its own **thermal amplitude** — sized from γ and the
-temperature — so the frames are Boltzmann-relevant, not the much larger
-visualization `--amplitude`. Every row's energy is referenced to the native frame
-and scaled by `--gamma` ($\gamma$):
+The `energy` subcommand builds a Monte-Carlo conformation pool: it merges every
+requested mode into one trajectory (native frame first) and writes a
+`frame,mode,rmsd,energy,energy_kJ_mol,weight` table to `--csv`. Each mode is swept
+over ±`--sigmas` σ (default 3) of its own **thermal amplitude** — sized from γ and
+the temperature — so the frames are Boltzmann-relevant. Every row's energy is
+referenced to the native frame and scaled by `--gamma` ($\gamma$):
 
 ```math
 E = E_\text{frame} - E_\text{native}, \qquad E_\text{kJ/mol} = \gamma E, \qquad w = \exp\left(-\frac{\gamma E}{RT}\right)
@@ -140,7 +144,7 @@ E = E_\text{frame} - E_\text{native}, \qquad E_\text{kJ/mol} = \gamma E, \qquad 
 
 with $R$ the molar gas constant and $T$ = `--temperature` (the native row is then
 $`E=0`$, $`w=1`$). By default $`E_\text{frame}`$ is the spring energy; `--voromqa`
-substitutes the VoroMQA score (both area-based) — defined under
+(on the `energy` verb) substitutes the VoroMQA score (both area-based) — defined under
 [Voronoi tessellation](#voronoi-tessellation). `frame` is the 0-based trajectory
 index (a multi-model PDB labels it `MODEL frame+1`).
 
@@ -152,13 +156,14 @@ a B-factor-fitted median over a small PDB set (`scripts/calibrate-gamma.sh`);
 since the fit is noisy across structures, pass `--b-factor-fit` for quantitative
 work.
 
-`--target <PDB>` morphs the structure toward a second conformation — NOLB's
-structure-to-structure transition. It superposes the target (Kabsch), projects the
-native→target motion onto the lowest `--modes` modes, and writes the morph to
-`--output` (nonlinear unless `--linear`). The report lists each mode's overlap with
-the motion, the cumulative overlap, and the RMSD remaining after each mode. The
-target must have the same atoms in the same order; mass-weighted modes are used
-(matching Pepsi/NOLB).
+The `transition` subcommand morphs the structure toward a second conformation —
+NOLB's structure-to-structure transition. It superposes the `--target` (Kabsch),
+projects the native→target motion onto the lowest `--modes` modes, and writes the
+morph to `--output` (nonlinear unless `--linear`). The report lists each mode's
+overlap with the motion, the cumulative overlap, and the RMSD remaining after each
+mode. The target must have the same atoms in the same order; mass-weighted modes are
+used (matching Pepsi/NOLB). For a large change, `--n-iter N` re-diagonalizes the
+network N times along the path so the modes follow the deformation (NOLB's `--nIter`).
 
 ## Voronoi tessellation
 
@@ -192,10 +197,10 @@ feed the same Hessian and energy; only the pair set and the weights $`w_{ij}`$
 differ, so their absolute frequencies are not directly comparable. `--voronota` is
 mutually exclusive with `--cutoff`.
 
-**`--voromqa` — knowledge-based scoring.** `--voromqa` scores each `--energy` frame
-with the [VoroMQA](https://github.com/kliment-olechnovic/voronota) contact-area
-potential (bundled v1), Boltzmann-inverted from the PDB, in place of the spring
-energy:
+**`--voromqa` — knowledge-based scoring.** On the `energy` subcommand, `--voromqa`
+scores each frame with the
+[VoroMQA](https://github.com/kliment-olechnovic/voronota) contact-area potential
+(bundled v1), Boltzmann-inverted from the PDB, in place of the spring energy:
 
 ```math
 E_\text{VoroMQA} = \sum_{(i,j)} A_{ij}\, e(t_i, t_j, c_{ij}) + \sum_a S_a\, e(t_a, \text{solvent})
@@ -215,8 +220,8 @@ physical constant**: the VoroMQA score is a dimensionless log-odds × area, so t
 columns carry kJ/mol *units* without a physical calibration. Only the relative
 weights matter; tune γ to set the spread (its B-factor-fitted default suits the
 springs, not VoroMQA). `--voromqa-file <path>` supplies a
-different potential; `--voromqa` and `--voromqa-file` are mutually exclusive and both
-require `--energy`.
+different potential; `--voromqa` and `--voromqa-file` are mutually exclusive options
+of the `energy` subcommand.
 
 **Relation to full Voronota.** elasticrab evaluates the score in-process with the
 lightweight [voronota-ltr](https://github.com/mlund/voronota-ltr) tessellation, not
