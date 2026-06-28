@@ -1,0 +1,18 @@
+# NOLB iterative nonlinear-transition reference: crambin_heavy.pdb -> crambin_hinge_large.pdb.
+#
+# Bond-preserving --nlin transition with --nIter 5 re-diagonalizations, generated once
+# with the NOLB binary (Hoffmann & Grudinin, the engine Pepsi-SAXS wraps); the test only
+# reads this file. elasticrab uses the same mass-weighted dot-product projection and
+# rigid-block extrapolation (confirmed by disassembly), so the initial alignment RMSD
+# agrees closely. elasticrab closes a bit less of the gap, in the same regime, because
+# NOLB keeps ~4 near-rigid modes its null-space detection misses (it reports size 2, not
+# 6) and uses an internal step-size line search, whereas elasticrab drops all six rigid
+# modes and takes one full step per iteration. So this is a regime cross-check, not a
+# bit-exact golden.
+#
+# Command: NOLB crambin_heavy.pdb crambin_hinge_large.pdb -n 10 --nlin --nIter 5 -s 20
+# NOLB version: 1.9, April 2020
+#
+# key value (Å)
+initial_rmsd 2.33049
+final_rmsd 1.60358

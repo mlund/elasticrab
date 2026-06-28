@@ -1205,11 +1205,13 @@ impl Transition<'_> {
         self.residuals[k.min(self.amplitudes.len())]
     }
 
-    /// Plain Cartesian RMSD (Å) of an arbitrary structure to the aligned target — e.g.
-    /// the actual endpoint of a nonlinear [`morph`](Self::morph), which the linear
-    /// [`residual_rmsd`](Self::residual_rmsd) does not describe.
+    /// Rigid-body-minimized Cartesian RMSD (Å) of an arbitrary structure to the target —
+    /// e.g. the actual endpoint of a nonlinear [`morph`](Self::morph), which the linear
+    /// [`residual_rmsd`](Self::residual_rmsd) does not describe. The target is re-superposed
+    /// (Kabsch) onto `structure`, so a nonlinear morph's residual rigid drift is removed —
+    /// the same convention [`transition_iterative`] reports per step.
     pub fn rmsd_to_target(&self, structure: &[[f64; 3]]) -> f64 {
-        rmsd(structure, &self.aligned_target)
+        aligned_rmsd(structure, &self.aligned_target)
     }
 
     /// The morph trajectory: `frames` frames from `native` (frame 0, when `frames > 1`)
@@ -1246,6 +1248,114 @@ impl Transition<'_> {
             })
             .collect()
     }
+}
+
+/// The trajectory and per-step RMSDs of a [`transition_iterative`] run.
+pub struct IterativeTransition {
+    frames: Vec<Vec<[f64; 3]>>,
+    step_rmsds: Vec<f64>,
+}
+
+impl IterativeTransition {
+    /// The full morph trajectory, native (frame 0) to the converged shape (last frame).
+    pub fn frames(&self) -> &[Vec<[f64; 3]>] {
+        &self.frames
+    }
+
+    /// Rigid-body-minimized RMSD to the target after each diagonalization: entry 0 is
+    /// the initial gap, then one per step. A non-increasing sequence as the path
+    /// converges.
+    pub fn step_rmsds(&self) -> &[f64] {
+        &self.step_rmsds
+    }
+
+    /// Rigid-body-minimized RMSD between native and target — the gap to close.
+    pub fn initial_rmsd(&self) -> f64 {
+        self.step_rmsds[0]
+    }
+
+    /// Rigid-body-minimized RMSD the converged trajectory leaves to the target.
+    pub fn final_rmsd(&self) -> f64 {
+        self.step_rmsds[self.step_rmsds.len() - 1]
+    }
+}
+
+/// NOLB's `--nlin --nIter`: an iterative nonlinear transition that **re-diagonalizes**
+/// the network at each intermediate shape.
+///
+/// A single [`Transition::morph`] extrapolates the *native* modes once, which
+/// under-shoots a large change because a mode's directions drift as the structure
+/// deforms. This re-solves at every step (the modes follow the deformation) and
+/// re-projects the remaining gap, converging much closer.
+///
+/// `solve` says how to build modes at a given shape — the one thing that varies between
+/// callers (distance cutoff, Voronoi tessellation, explicit springs); the modes it
+/// returns must carry rigid blocks. `redo` is the number of *additional* diagonalizations
+/// beyond the first (`0` reproduces a single nonlinear morph; NOLB recommends `5`).
+/// Each step contributes `frames_per_step` frames (ending at that step's full
+/// extrapolation), so the trajectory holds `(redo + 1)·frames_per_step + 1` frames.
+///
+/// # Errors
+/// [`Error::AtomCountMismatch`] if `native` and `target` differ in length; whatever
+/// `solve` returns; [`Error::NotRigidBlocks`] if `solve` returns modes without blocks.
+///
+/// # Example
+/// ```no_run
+/// use elasticrab::{transition_iterative, Atom, NormalModes};
+/// # fn demo(native: &[[f64; 3]], target: &[[f64; 3]], masses: Vec<f64>, blocks: Vec<usize>)
+/// #     -> Result<(), elasticrab::Error> {
+/// // The closure is the only thing the caller supplies: how to build modes at a given
+/// // shape — here a 5 Å mass-weighted rigid-block network, rebuilt each iteration.
+/// let result = transition_iterative(native, target, 5, 10, |positions| {
+///     let atoms: Vec<Atom> = positions
+///         .iter()
+///         .zip(&masses)
+///         .map(|(&position, &mass)| Atom { position, mass })
+///         .collect();
+///     NormalModes::builder(&atoms).cutoff(5.0).blocks(&blocks).mass_weighted().solve()
+/// })?;
+/// println!("RMSD {:.3} → {:.3} Å", result.initial_rmsd(), result.final_rmsd());
+/// # Ok(())
+/// # }
+/// ```
+pub fn transition_iterative<F>(
+    native: &[[f64; 3]],
+    target: &[[f64; 3]],
+    redo: usize,
+    frames_per_step: usize,
+    mut solve: F,
+) -> Result<IterativeTransition, Error>
+where
+    F: FnMut(&[[f64; 3]]) -> Result<NormalModes, Error>,
+{
+    if native.is_empty() || native.len() != target.len() {
+        return Err(Error::AtomCountMismatch);
+    }
+    let mut frames = vec![native.to_vec()];
+    let mut step_rmsds = vec![aligned_rmsd(native, target)];
+    let mut current = native.to_vec();
+    for _ in 0..=redo {
+        let modes = solve(&current)?;
+        let fit = modes.transition(&current, target)?;
+        // Reuse the public morph for this step: `frames_per_step + 1` frames (t = 0..1)
+        // from the current shape. Drop frame 0 (the shape we start from) and keep the
+        // rest, ending at the full step the next iteration re-diagonalizes at.
+        let trajectory = fit.morph(frames_per_step + 1, true)?;
+        current = trajectory
+            .last()
+            .expect("morph yields the endpoint")
+            .clone();
+        frames.extend(trajectory.into_iter().skip(1));
+        step_rmsds.push(aligned_rmsd(&current, target));
+    }
+    Ok(IterativeTransition { frames, step_rmsds })
+}
+
+/// Rigid-body-minimized RMSD: superpose `target` onto `structure` (Kabsch) and measure
+/// the remaining Cartesian RMSD — the internal-deformation gap, rigid motion removed.
+fn aligned_rmsd(structure: &[[f64; 3]], target: &[[f64; 3]]) -> f64 {
+    let aligned = align::superpose(structure, target).apply(target);
+    rmsd(structure, &aligned)
 }
 
 /// Add `coeff · (mode / √w)` per atom to `out`, in place — one fitted mode's

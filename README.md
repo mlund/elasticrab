@@ -37,9 +37,9 @@ fn main() -> Result<(), elasticrab::Error> {
 - **Mode visualization** — linear and NOLB nonlinear (bond-preserving) displacement.
 - **Conformational energy** — `NormalModes::energy()` scores any structure with the network's spring energy, for Boltzmann reweighting of sampled conformations.
 - **Mode analysis** — `NormalModes::collectivity()` is the Brüschweiler κ (NOLB's `--collectivity`): the effective fraction of atoms a mode moves, for picking collective modes; shown per mode in the report.
-- **Structural transitions** — `NormalModes::transition()` Kabsch-aligns a target conformation, projects the native→target motion onto the modes, and morphs toward it (linear or NOLB-nonlinear), reporting per-mode overlap and RMSD reduction — NOLB's structure-to-structure transition.
+- **Structural transitions** — `NormalModes::transition()` Kabsch-aligns a target conformation, projects the native→target motion onto the modes, and morphs toward it (linear or NOLB-nonlinear), reporting per-mode overlap and RMSD reduction — NOLB's structure-to-structure transition. For large changes, `transition_iterative()` (CLI `--n-iter`) re-diagonalizes the network along the path so the modes follow the deformation — NOLB's `--nlin`/`--nIter`.
 - **Command-line tool** (`cli` feature) — the `elasticrab` binary animates modes into PDB/XTC trajectories, with PDB/mmCIF input, VMD-like atom selection, a JSON report, and a per-frame energy table for Monte-Carlo reweighting.
-- **Tests** (`cargo test`) — property, analytic, and golden tests: ProDy spectra to `atol = 1e-5` (1UBI, 2GB1), NOLB-proportional frequencies to ~0.1% and per-mode collectivities to <0.03 (crambin), including the disconnected-atom drop.
+- **Tests** (`cargo test`) — property, analytic, and golden tests: ProDy spectra to `atol = 1e-5` (1UBI, 2GB1), NOLB-proportional frequencies to ~0.1% and per-mode collectivities to <0.03 (crambin), the structure-to-structure transitions (single and iterative), and the disconnected-atom drop.
 - **Fixtures** — vendored reference data (ProDy Hessians and eigenvalues, NOLB frequencies), so tests need no external binary.
 
 ## What it does
