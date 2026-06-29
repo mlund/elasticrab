@@ -1,14 +1,16 @@
-//! File output for the CLI: a multi-model PDB writer and an XTC writer (molly).
+//! File output for the CLI: multi-model PDB, XTC (molly), NMD/NMWiz, and CSV.
 //! voronota-ltr parses structures but does not write them, so the writers live
 //! here; the atomic-mass table is a small lookup voronota does not provide.
 
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufWriter, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use molly::{Frame, XTCWriter};
 use voronota_ltr::input::AtomRecord;
+
+use elasticrab::NormalModes;
 
 /// A trajectory: one entry per frame, each a per-atom coordinate set (ångström).
 pub type Trajectory = [Vec<[f64; 3]>];
@@ -84,6 +86,164 @@ pub fn write_pdb(path: &Path, records: &[AtomRecord], frames: &Trajectory) -> Re
             .map_err(|e| writing(path, &e))?;
     }
     writer.flush().map_err(|e| writing(path, &e))
+}
+
+/// Write normal modes in NMD format for VMD's NMWiz plugin. Unlike PDB/XTC this is
+/// not a trajectory: it stores the native coordinates once and then the requested
+/// mode vectors. `mode_scale_rmsd` is the RMSD reached when NMWiz applies the
+/// normalized mode at scale 1.
+pub fn write_nmd(
+    path: &Path,
+    records: &[AtomRecord],
+    positions: &[[f64; 3]],
+    modes: &NormalModes,
+    wanted: &[usize],
+    mode_scale_rmsd: f64,
+) -> Result<(), String> {
+    let file = File::create(path).map_err(|e| writing(path, &e))?;
+    let mut writer = BufWriter::new(file);
+    let mut line = String::new();
+
+    writeln!(writer, "nmwiz_load {}", absolute_path(path).display())
+        .map_err(|e| writing(path, &e))?;
+    writeln!(writer, "name {}", nmd_name(path)).map_err(|e| writing(path, &e))?;
+    write_tokens(
+        &mut writer,
+        path,
+        "atomnames",
+        records.iter().map(|r| nmd_token(&r.name)),
+    )?;
+    write_tokens(
+        &mut writer,
+        path,
+        "resnames",
+        records.iter().map(|r| nmd_token(&r.res_name)),
+    )?;
+    write_tokens(
+        &mut writer,
+        path,
+        "resids",
+        records.iter().map(|r| r.res_seq.to_string()),
+    )?;
+    write_tokens(
+        &mut writer,
+        path,
+        "chainids",
+        records.iter().map(|r| nmd_token(&r.chain_id)),
+    )?;
+    write_numbers(
+        &mut writer,
+        path,
+        "bfactors",
+        records.iter().map(|r| r.b_factor),
+        "{:.2}",
+    )?;
+    write_numbers(
+        &mut writer,
+        path,
+        "coordinates",
+        positions.iter().flat_map(|p| [p[0], p[1], p[2]]),
+        "{:.3}",
+    )?;
+
+    let scale = mode_scale_rmsd * (records.len() as f64).sqrt();
+    for &mode in wanted {
+        let i = mode - 1;
+        let displacement = modes.mode_displacement(i);
+        let norm = displacement_norm(&displacement);
+        if norm <= 0.0 || !norm.is_finite() {
+            continue;
+        }
+        line.clear();
+        let _ = write!(line, "mode {mode} {:.6}", scale);
+        for p in displacement {
+            for x in p {
+                let _ = write!(line, " {:.6}", x / norm);
+            }
+        }
+        line.push('\n');
+        writer
+            .write_all(line.as_bytes())
+            .map_err(|e| writing(path, &e))?;
+    }
+    writer.flush().map_err(|e| writing(path, &e))
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+fn nmd_name(path: &Path) -> String {
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("elasticrab");
+    nmd_token(name)
+}
+
+fn nmd_token(value: &str) -> String {
+    let token: String = value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if token.is_empty() {
+        "_".to_string()
+    } else {
+        token
+    }
+}
+
+fn write_tokens(
+    writer: &mut BufWriter<File>,
+    path: &Path,
+    label: &str,
+    values: impl IntoIterator<Item = String>,
+) -> Result<(), String> {
+    write!(writer, "{label}").map_err(|e| writing(path, &e))?;
+    for value in values {
+        write!(writer, " {value}").map_err(|e| writing(path, &e))?;
+    }
+    writeln!(writer).map_err(|e| writing(path, &e))
+}
+
+fn write_numbers(
+    writer: &mut BufWriter<File>,
+    path: &Path,
+    label: &str,
+    values: impl IntoIterator<Item = f64>,
+    format: &str,
+) -> Result<(), String> {
+    write!(writer, "{label}").map_err(|e| writing(path, &e))?;
+    for value in values {
+        match format {
+            "{:.2}" => write!(writer, " {value:.2}"),
+            "{:.3}" => write!(writer, " {value:.3}"),
+            _ => write!(writer, " {value:.6}"),
+        }
+        .map_err(|e| writing(path, &e))?;
+    }
+    writeln!(writer).map_err(|e| writing(path, &e))
+}
+
+fn displacement_norm(displacement: &[[f64; 3]]) -> f64 {
+    displacement
+        .iter()
+        .flat_map(|p| p.iter())
+        .map(|x| x * x)
+        .sum::<f64>()
+        .sqrt()
 }
 
 /// Append one fixed-column `ATOM` line at new coordinates. The serial and residue

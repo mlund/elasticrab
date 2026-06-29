@@ -11,8 +11,8 @@
 
 Elasticrab is a command-line tool for protein normal-mode analysis. It reads a
 PDB or mmCIF structure, builds an elastic network, computes the lowest
-mass-weighted rigid-block modes, and writes trajectories, transition morphs, or
-energy tables for downstream analysis.
+mass-weighted rigid-block modes, and writes trajectories, NMWiz mode files,
+transition morphs, or energy tables for downstream analysis.
 
 The project also exposes a small Rust library. The CLI is the main user-facing
 tool; the library is for developers who want to embed the same ANM solver in
@@ -23,8 +23,8 @@ _Pronunciation:_ ih-LAS-tee-krab (/ɪˈlæs.ti.kræb/)
 ## Features
 
 - **Protein-focused CLI**: read PDB or mmCIF, select atoms with VMD-like
-  expressions, report mode frequencies and collectivity, and write PDB or XTC
-  trajectories.
+  expressions, report mode frequencies and collectivity, and write PDB/XTC
+  trajectories or NMD files for VMD's NMWiz plugin.
 - **Three workflows**: `animate` visualizes modes, `transition` morphs one
   structure toward another, and `energy` builds a thermally sampled trajectory
   with a per-frame weight table.
@@ -87,6 +87,13 @@ inserts `_mode1`, `_mode2`, ... before the output extension:
 
 ```sh
 elasticrab -i protein.pdb -n 5 -o modes.xtc animate
+```
+
+Write the same modes as one NMD file for interactive visualization in NMWiz:
+
+```sh
+elasticrab -i protein.pdb -n 5 -o modes.nmd animate
+vmd -e modes.nmd
 ```
 
 Use a Voronoi tessellation instead of a distance cutoff:
@@ -159,11 +166,14 @@ The report lists how many atoms were dropped.
 ### `animate`
 
 `animate` writes one trajectory per requested mode. By default it uses the
-softest mode, writes 20 frames, and uses nonlinear rigid-block displacement.
+softest mode, writes 20 frames, and uses nonlinear rigid-block displacement. If
+the output path ends in `.nmd`, `animate` writes one NMD file containing the
+requested mode vectors for VMD's NMWiz plugin instead of trajectory frames.
 
 ```sh
 elasticrab -i protein.pdb -o mode1.pdb animate
 elasticrab -i protein.pdb -n 5 -o modes.xtc animate
+elasticrab -i protein.pdb -n 5 -o modes.nmd animate
 elasticrab -i protein.pdb animate --mode 3 --amplitude 2.0
 ```
 
@@ -173,9 +183,15 @@ Important options:
 - `--mode INDEX`: animate a specific 1-based mode. Repeat it to request several
   modes.
 - `-s, --frames N`: number of frames. Use `0` for report only.
-- `-a, --amplitude RMSD`: peak displacement RMSD in Å.
+- `-a, --amplitude RMSD`: peak displacement RMSD in Å. For `.nmd` output, this
+  sets the mode scale stored for NMWiz.
 - `--linear`: use linear displacement instead of the nonlinear bond-preserving
   displacement.
+
+NMD output is not a trajectory. It stores the native coordinates once, preserves
+atom labels and B-factors when available, and stores the requested Cartesian mode
+displacement vectors. `--frames` is ignored for `.nmd` output. A generated file
+can be opened directly in VMD with `vmd -e modes.nmd`.
 
 ### `transition`
 
@@ -444,15 +460,16 @@ between $E_\text{frame}$ and $E_\text{native}$.
 
 ## Output Files
 
-Trajectory format is chosen from the output extension:
+Output format is chosen from the output extension:
 
 - `.pdb`: multi-model PDB.
 - `.xtc`: XTC trajectory.
+- `.nmd`: NMD mode file for NMWiz; supported by `animate`.
 - any other extension: PDB.
 
 If no output path is given, Elasticrab writes beside the input structure:
 
-- `animate`: `<input>_mode1.pdb`, or one file per mode.
+- `animate`: `<input>_mode1.pdb`, or one trajectory file per mode.
 - `transition`: `<input>_morph.pdb`.
 - `energy`: `<input>_modes.pdb` plus the required CSV path.
 
@@ -474,8 +491,8 @@ the numerical method against independent tools and lock down CLI behavior.
 - **Transitions**: single-shot and iterative nonlinear transitions reduce RMSD
   and are checked against NOLB reference regimes.
 - **Edge cases**: tests cover rigid-body zero modes, disconnected atoms,
-  explicit spring weights, invalid inputs, CLI help, mode selection, and energy
-  CSV generation.
+  explicit spring weights, invalid inputs, CLI help, mode selection, NMD export,
+  and energy CSV generation.
 
 Run the full checked CLI suite with:
 

@@ -85,7 +85,7 @@ struct SolveArgs {
     #[arg(long, value_name = "EXPR")]
     select: Option<String>,
 
-    /// Trajectory output path; format by `.pdb`/`.xtc` extension.
+    /// Output path; `.pdb`/`.xtc` for trajectories, `.nmd` for animate/NMWiz modes.
     #[arg(short = 'o', long, value_name = "PATH")]
     output: Option<PathBuf>,
 
@@ -313,10 +313,25 @@ fn solve_and_report(
     Ok((modes, wanted, gamma))
 }
 
-/// `animate`: the spectrum report plus a PDB/XTC trajectory per requested mode.
+/// `animate`: the spectrum report plus either a PDB/XTC trajectory per requested
+/// mode, or one `.nmd` file containing all requested modes for NMWiz.
 fn run_animate(solve: &SolveArgs, mode: &[usize], amplitude: f64) -> Result<(), String> {
     let prep = prepare(solve)?;
     let (modes, wanted, _gamma) = solve_and_report(solve, &prep, mode)?;
+
+    if let Some(path) = solve.output.as_deref().filter(|path| is_nmd(path)) {
+        guard_input(path, &solve.input)?;
+        io::write_nmd(
+            path,
+            &prep.records,
+            &prep.positions,
+            &modes,
+            &wanted,
+            amplitude,
+        )?;
+        println!("  wrote {}", path.display());
+        return Ok(());
+    }
 
     if solve.frames > 0 {
         let multi = wanted.len() > 1;
@@ -725,15 +740,24 @@ fn write_trajectory(
     records: &[AtomRecord],
     frames: &io::Trajectory,
 ) -> Result<(), String> {
-    if path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("xtc"))
-    {
+    if is_nmd(path) {
+        return Err(".nmd output is only supported by the animate command".into());
+    }
+    if has_extension(path, "xtc") {
         io::write_xtc(path, frames)
     } else {
         io::write_pdb(path, records, frames)
     }
+}
+
+fn is_nmd(path: &Path) -> bool {
+    has_extension(path, "nmd")
+}
+
+fn has_extension(path: &Path, expected: &str) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case(expected))
 }
 
 /// Where mode `mode`'s trajectory is written: the explicit `-o` for a single

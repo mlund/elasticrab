@@ -39,6 +39,56 @@ fn animate_reports_the_spectrum() {
 }
 
 #[test]
+fn animate_writes_combined_nmd_when_requested() {
+    let nmd = std::env::temp_dir().join(format!("elasticrab_cli_modes_{}.nmd", std::process::id()));
+    let out = run(&[
+        "-i",
+        &input(),
+        "-s",
+        "0",
+        "-o",
+        nmd.to_str().unwrap(),
+        "animate",
+        "--mode",
+        "1",
+        "--mode",
+        "3",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(&nmd).unwrap();
+    assert!(text.contains("nmwiz_load "), "{text}");
+    assert!(text.contains("\ncoordinates "), "{text}");
+    assert!(text.contains("\nmode 1 "), "{text}");
+    assert!(text.contains("\nmode 3 "), "{text}");
+    assert!(!text.contains("\nmode 2 "), "{text}");
+
+    let atom_count = nmd_field_count(&text, "atomnames");
+    assert!(atom_count > 0, "{text}");
+    assert_eq!(nmd_field_count(&text, "coordinates"), 3 * atom_count);
+    for mode in ["mode 1", "mode 3"] {
+        // After `mode N`, NMD stores the NMWiz scale and a 3-vector per atom.
+        assert_eq!(nmd_field_count(&text, mode), 1 + 3 * atom_count);
+    }
+    assert!(
+        stdout(&out).contains(nmd.to_str().unwrap()),
+        "{}",
+        stdout(&out)
+    );
+    let _ = std::fs::remove_file(&nmd);
+}
+
+fn nmd_field_count(text: &str, label: &str) -> usize {
+    text.lines()
+        .find_map(|line| line.strip_prefix(label))
+        .map(|rest| rest.split_whitespace().count())
+        .unwrap_or(0)
+}
+
+#[test]
 fn transition_reports_overlaps() {
     let target = format!("{DATA}/crambin_hinge.pdb");
     let out = run(&[
