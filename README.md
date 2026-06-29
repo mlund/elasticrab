@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/87ed30fa-b33d-4bb6-859b-17e04c9708cc" alt="Elasticrab logo" width="320">
-</p>
-<p align="center">
   <a href="https://github.com/mlund/elasticrab/actions/workflows/ci.yml">
     <img src="https://github.com/mlund/elasticrab/actions/workflows/ci.yml/badge.svg">
   </a>
+</p>
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/f5cb7e88-5d08-4fcf-b272-4fbead8c3b37" alt="Elasticrab logo" width="320">
 </p>
 
 # Elasticrab
