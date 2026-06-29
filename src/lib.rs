@@ -682,6 +682,22 @@ impl NormalModes {
     ///
     /// # Panics
     /// If `i >= self.len()`, or `positions.len()` is not the original atom count.
+    ///
+    /// # Example
+    /// ```
+    /// use elasticrab::{Atom, NormalModes};
+    ///
+    /// let atoms = vec![
+    ///     Atom { position: [0.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [1.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [0.0, 1.0, 0.0], mass: 12.0 },
+    /// ];
+    /// let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
+    /// let modes = NormalModes::builder(&atoms).cutoff(2.0).solve().unwrap();
+    ///
+    /// let frame = modes.displace(&positions, 0, 0.25);
+    /// assert_eq!(frame.len(), positions.len());
+    /// ```
     pub fn displace(&self, positions: &[[f64; 3]], i: usize, amplitude: f64) -> Vec<[f64; 3]> {
         let mode = self.eigenvector(i);
         assert_eq!(
@@ -823,6 +839,24 @@ impl NormalModes {
     ///
     /// # Panics
     /// If `amplitudes.len() > self.len()`, or `positions.len()` is not the atom count.
+    ///
+    /// # Example
+    /// ```
+    /// use elasticrab::{Atom, NormalModes};
+    ///
+    /// let atoms = vec![
+    ///     Atom { position: [0.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [1.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [0.0, 1.0, 0.0], mass: 12.0 },
+    /// ];
+    /// let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
+    /// let modes = NormalModes::builder(&atoms).cutoff(2.0).solve().unwrap();
+    ///
+    /// let frame = modes
+    ///     .displace_by_amplitudes(&positions, &[0.2, -0.1], false)
+    ///     .unwrap();
+    /// assert_eq!(frame.len(), atoms.len());
+    /// ```
     pub fn displace_by_amplitudes(
         &self,
         positions: &[[f64; 3]],
@@ -863,6 +897,31 @@ impl NormalModes {
     /// [`Error::AtomCountMismatch`] unless `native` and `target` each have one entry
     /// per modelled atom, in the same order (aligning differing structures is not
     /// yet supported).
+    ///
+    /// # Example
+    /// ```
+    /// use elasticrab::{Atom, NormalModes};
+    ///
+    /// let native = vec![
+    ///     [0.0, 0.0, 0.0],
+    ///     [1.0, 0.0, 0.0],
+    ///     [0.0, 1.0, 0.0],
+    /// ];
+    /// let target = vec![
+    ///     [0.0, 0.0, 0.0],
+    ///     [1.2, 0.0, 0.0],
+    ///     [0.0, 1.1, 0.0],
+    /// ];
+    /// let atoms: Vec<Atom> = native
+    ///     .iter()
+    ///     .map(|&position| Atom { position, mass: 12.0 })
+    ///     .collect();
+    /// let modes = NormalModes::builder(&atoms).cutoff(2.0).solve().unwrap();
+    ///
+    /// let transition = modes.transition(&native, &target).unwrap();
+    /// assert!(transition.initial_rmsd() > 0.0);
+    /// assert_eq!(transition.overlaps().len(), modes.len());
+    /// ```
     pub fn transition<'a>(
         &'a self,
         native: &[[f64; 3]],
@@ -947,6 +1006,19 @@ impl NormalModes {
     /// connected network. A dropped atom's entry is `[0, 0, 0]` in every mode.
     ///
     /// This mirrors Pepsi-SAXS / NOLB, which exclude such atoms before solving.
+    ///
+    /// # Example
+    /// ```
+    /// use elasticrab::{Atom, NormalModes};
+    ///
+    /// let atoms = vec![
+    ///     Atom { position: [0.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [1.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [10.0, 0.0, 0.0], mass: 12.0 },
+    /// ];
+    /// let modes = NormalModes::builder(&atoms).cutoff(1.5).solve().unwrap();
+    /// assert_eq!(modes.disconnected(), &[2]);
+    /// ```
     pub fn disconnected(&self) -> &[usize] {
         &self.disconnected
     }
@@ -962,6 +1034,21 @@ impl NormalModes {
     ///
     /// The absolute scale is arbitrary in an ANM (it rides on `gamma`); the
     /// useful information is the *relative* amplitude across modes.
+    ///
+    /// # Example
+    /// ```
+    /// use elasticrab::{Atom, NormalModes};
+    ///
+    /// let atoms = vec![
+    ///     Atom { position: [0.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [1.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [0.0, 1.0, 0.0], mass: 12.0 },
+    /// ];
+    /// let modes = NormalModes::builder(&atoms).cutoff(2.0).gamma(1.0).solve().unwrap();
+    ///
+    /// let amplitudes = modes.thermal_amplitudes(298.15);
+    /// assert_eq!(amplitudes.len(), modes.len());
+    /// ```
     pub fn thermal_amplitudes(&self, temperature_k: f64) -> Vec<f64> {
         let two_rt = 2.0 * GAS_CONSTANT_KJ_PER_MOL_K * temperature_k;
         self.eigenvalues
@@ -988,6 +1075,26 @@ impl NormalModes {
     ///
     /// # Panics
     /// If `i >= self.len()`.
+    ///
+    /// # Example
+    /// ```
+    /// use elasticrab::{Atom, NormalModes};
+    ///
+    /// let atoms = vec![
+    ///     Atom { position: [0.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [1.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [0.0, 1.0, 0.0], mass: 12.0 },
+    /// ];
+    /// let modes = NormalModes::builder(&atoms).cutoff(2.0).solve().unwrap();
+    /// let mode = modes
+    ///     .eigenvalues()
+    ///     .iter()
+    ///     .position(|&lambda| lambda > 1e-9)
+    ///     .unwrap();
+    ///
+    /// let kappa = modes.collectivity(mode);
+    /// assert!(kappa > 0.0 && kappa <= 1.0);
+    /// ```
     pub fn collectivity(&self, i: usize) -> f64 {
         let amplitudes = self.mode_displacement(i);
         let squared = |d: &[f64; 3]| d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
@@ -1022,6 +1129,21 @@ impl NormalModes {
     /// (without [`Builder::mass_weighted`]). The result is one value per original
     /// atom; a disconnected atom (zero in every mode) scores 0. With γ in
     /// kJ/mol/Å² the values are in Å².
+    ///
+    /// # Example
+    /// ```
+    /// use elasticrab::{Atom, NormalModes};
+    ///
+    /// let atoms = vec![
+    ///     Atom { position: [0.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [1.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [0.0, 1.0, 0.0], mass: 12.0 },
+    /// ];
+    /// let modes = NormalModes::builder(&atoms).cutoff(2.0).gamma(1.0).solve().unwrap();
+    ///
+    /// let msf = modes.fluctuations(298.15);
+    /// assert_eq!(msf.len(), atoms.len());
+    /// ```
     pub fn fluctuations(&self, temperature_k: f64) -> Vec<f64> {
         let rt = GAS_CONSTANT_KJ_PER_MOL_K * temperature_k;
         let mut msf = vec![0.0; self.n_atoms];
@@ -1042,6 +1164,21 @@ impl NormalModes {
     /// observable for comparing against, or calibrating `gamma` to, an
     /// experimental structure. Configurational like the fluctuations, so build the
     /// modes **without** mass-weighting; in Å² when γ is in kJ/mol/Å².
+    ///
+    /// # Example
+    /// ```
+    /// use elasticrab::{Atom, NormalModes};
+    ///
+    /// let atoms = vec![
+    ///     Atom { position: [0.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [1.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [0.0, 1.0, 0.0], mass: 12.0 },
+    /// ];
+    /// let modes = NormalModes::builder(&atoms).cutoff(2.0).gamma(1.0).solve().unwrap();
+    ///
+    /// let b = modes.predicted_b_factors(298.15);
+    /// assert_eq!(b.len(), atoms.len());
+    /// ```
     pub fn predicted_b_factors(&self, temperature_k: f64) -> Vec<f64> {
         const PREFACTOR: f64 = 8.0 * std::f64::consts::PI * std::f64::consts::PI / 3.0;
         self.fluctuations(temperature_k)
@@ -1064,6 +1201,26 @@ impl NormalModes {
     ///
     /// # Panics
     /// If `positions.len()` is not the original atom count.
+    ///
+    /// # Example
+    /// ```
+    /// use elasticrab::{Atom, NormalModes, Spring};
+    ///
+    /// let atoms = vec![
+    ///     Atom { position: [0.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [1.0, 0.0, 0.0], mass: 12.0 },
+    /// ];
+    /// let springs = [Spring { i: 0, j: 1, weight: 1.0 }];
+    /// let modes = NormalModes::builder(&atoms)
+    ///     .springs(&springs)
+    ///     .gamma(2.0)
+    ///     .solve()
+    ///     .unwrap();
+    ///
+    /// let stretched = [[0.0, 0.0, 0.0], [1.2, 0.0, 0.0]];
+    /// let energy = modes.energy(&stretched);
+    /// assert!((energy - 0.04).abs() < 1e-12);
+    /// ```
     pub fn energy(&self, positions: &[[f64; 3]]) -> f64 {
         assert_eq!(
             positions.len(),
@@ -1118,6 +1275,24 @@ impl<'a> Builder<'a> {
     /// Use an explicit list of weighted springs (e.g. area-weighted Voronoi
     /// contacts) instead of a cutoff. Mutually exclusive with
     /// [`cutoff`](Self::cutoff).
+    ///
+    /// # Example
+    /// ```
+    /// use elasticrab::{Atom, NormalModes, Spring};
+    ///
+    /// let atoms = vec![
+    ///     Atom { position: [0.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [1.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [0.0, 1.0, 0.0], mass: 12.0 },
+    /// ];
+    /// let springs = [
+    ///     Spring { i: 0, j: 1, weight: 1.0 },
+    ///     Spring { i: 0, j: 2, weight: 0.5 },
+    /// ];
+    ///
+    /// let modes = NormalModes::builder(&atoms).springs(&springs).solve().unwrap();
+    /// assert_eq!(modes.spring_count(), 2);
+    /// ```
     #[must_use]
     pub const fn springs(mut self, springs: &'a [Spring]) -> Self {
         self.springs = Some(springs);
@@ -1155,6 +1330,28 @@ impl<'a> Builder<'a> {
     /// Group atoms into rigid blocks (Rotation-Translation Blocks): one block id
     /// per atom, parallel to `atoms`. Shrinks the eigenproblem and enables the
     /// nonlinear extrapolation; the modes are still per-atom fields.
+    ///
+    /// # Example
+    /// ```
+    /// use elasticrab::{Atom, NormalModes};
+    ///
+    /// let atoms = vec![
+    ///     Atom { position: [0.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [1.0, 0.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [0.0, 1.0, 0.0], mass: 12.0 },
+    ///     Atom { position: [0.0, 0.0, 1.0], mass: 12.0 },
+    /// ];
+    /// let blocks = [0, 1, 2, 3]; // one single-atom rigid block per atom
+    /// let positions: Vec<[f64; 3]> = atoms.iter().map(|a| a.position).collect();
+    ///
+    /// let modes = NormalModes::builder(&atoms)
+    ///     .cutoff(2.0)
+    ///     .blocks(&blocks)
+    ///     .solve()
+    ///     .unwrap();
+    /// let displaced = modes.displace_nonlinear(&positions, 0, 0.1).unwrap();
+    /// assert_eq!(displaced.len(), atoms.len());
+    /// ```
     #[must_use]
     pub const fn blocks(mut self, blocks: &'a [usize]) -> Self {
         self.blocks = Some(blocks);
@@ -1239,6 +1436,32 @@ impl Transition<'_> {
     /// # Errors
     /// [`Error::NotRigidBlocks`] if `nonlinear` is set but the modes were built
     /// without rigid blocks.
+    ///
+    /// # Example
+    /// ```
+    /// use elasticrab::{Atom, NormalModes};
+    ///
+    /// let native = vec![
+    ///     [0.0, 0.0, 0.0],
+    ///     [1.0, 0.0, 0.0],
+    ///     [0.0, 1.0, 0.0],
+    /// ];
+    /// let target = vec![
+    ///     [0.0, 0.0, 0.0],
+    ///     [1.2, 0.0, 0.0],
+    ///     [0.0, 1.1, 0.0],
+    /// ];
+    /// let atoms: Vec<Atom> = native
+    ///     .iter()
+    ///     .map(|&position| Atom { position, mass: 12.0 })
+    ///     .collect();
+    /// let modes = NormalModes::builder(&atoms).cutoff(2.0).solve().unwrap();
+    ///
+    /// let transition = modes.transition(&native, &target).unwrap();
+    /// let morph = transition.morph(4, false).unwrap();
+    /// assert_eq!(morph.len(), 4);
+    /// assert_eq!(morph[0].len(), native.len());
+    /// ```
     pub fn morph(&self, frames: usize, nonlinear: bool) -> Result<Vec<Vec<[f64; 3]>>, Error> {
         // The nonlinear path's reduced velocity is linear in the amplitudes, so build
         // it once and scale by t per frame rather than re-running the matvec.
