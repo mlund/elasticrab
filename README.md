@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/87ed30fa-b33d-4bb6-859b-17e04c9708cc" alt="ElastiCrab logo" width="320">
+  <img src="https://github.com/user-attachments/assets/87ed30fa-b33d-4bb6-859b-17e04c9708cc" alt="Elasticrab logo" width="320">
 </p>
 <p align="center">
   <a href="https://github.com/mlund/elasticrab/actions/workflows/ci.yml">
@@ -7,9 +7,9 @@
   </a>
 </p>
 
-# ElastiCrab
+# Elasticrab
 
-ElastiCrab is a command-line tool for protein normal-mode analysis. It reads a
+Elasticrab is a command-line tool for protein normal-mode analysis. It reads a
 PDB or mmCIF structure, builds an elastic network, computes the lowest
 mass-weighted rigid-block modes, and writes trajectories, transition morphs, or
 energy tables for downstream analysis.
@@ -18,6 +18,8 @@ The project also exposes a small Rust library. The CLI is the main user-facing
 tool; the library is for developers who want to embed the same ANM solver in
 their own programs.
 
+_Pronunciation:_ ih-LAS-tee-krab (/ɪˈlæs.ti.kræb/)
+
 ## Features
 
 - **Protein-focused CLI**: read PDB or mmCIF, select atoms with VMD-like
@@ -25,7 +27,7 @@ their own programs.
   trajectories.
 - **Three workflows**: `animate` visualizes modes, `transition` morphs one
   structure toward another, and `energy` builds a thermally sampled trajectory
-  with a per-frame Monte Carlo weight table.
+  with a per-frame weight table.
 - **Rigid-block normal modes**: the CLI groups atoms by residue, uses
   mass-weighted Rotation-Translation Blocks (RTB), and uses NOLB-style nonlinear
   displacement by default to preserve bonds within each block.
@@ -36,15 +38,15 @@ their own programs.
 - **Reproducible outputs**: text reports go to stdout, JSON reports are optional,
   and energy tables are written as CSV.
 - **Tests as a feature**: the test suite checks the ANM Hessian and spectra
-  against ProDy, RTB spectra against ProDy, mass-weighted RTB frequencies and
-  collectivities against NOLB references, transition behavior, CLI grammar, and
-  disconnected-atom handling. The reference fixtures are vendored, so tests do
-  not require external binaries.
+  against [ProDy](https://github.com/prody/ProDy), RTB spectra against ProDy,
+  mass-weighted RTB frequencies and
+  collectivities against [NOLB](https://team.inria.fr/nano-d/software/nolb-normal-modes/)
+  references, transition behavior, CLI grammar, and disconnected-atom handling.
 
 ## Installation
 
-ElastiCrab is a Rust project. Install Rust and Cargo first, then install the CLI
-from the repository:
+Elasticrab is written in Rust. [Install Rust](https://rust-lang.org/tools/install/)
+first, then install the CLI from the repository:
 
 ```sh
 cargo install --git https://github.com/mlund/elasticrab --features cli
@@ -80,7 +82,7 @@ Print a report for the softest mode without writing a trajectory:
 elasticrab -i protein.pdb -s 0 animate
 ```
 
-Animate the five lowest modes. When several modes are requested, ElastiCrab
+Animate the five lowest modes. When several modes are requested, Elasticrab
 inserts `_mode1`, `_mode2`, ... before the output extension:
 
 ```sh
@@ -133,8 +135,8 @@ elasticrab energy --help
 
 ## Input Model
 
-ElastiCrab reads PDB and mmCIF files. The CLI uses atomic coordinates and element
-names, groups atoms into one rigid block per residue, and drops waters. HETATM
+Elasticrab reads PDB and mmCIF files. The CLI uses atomic coordinates and element
+names, groups atoms into one rigid block per residue, and always drops waters. HETATM
 records are excluded unless `--hetatm` is set.
 
 Atom selections use VMD-like expressions, for example:
@@ -144,7 +146,7 @@ elasticrab -i protein.pdb --select "chain A and name CA" animate
 ```
 
 The `transition` command requires the native and target files to contain the
-same atoms in the same order after any selection. ElastiCrab rigid-body aligns
+same atoms in the same order after any selection. Elasticrab rigid-body aligns
 the target to the native structure before projecting the internal deformation
 onto the modes.
 
@@ -217,7 +219,7 @@ The CSV columns are:
 | `energy_kJ_mol` | `--gamma` times `energy` |
 | `weight` | Boltzmann weight relative to the native frame |
 
-ElastiCrab uses
+Elasticrab uses
 
 $$
 \Delta E = E_\text{frame} - E_\text{native}
@@ -263,19 +265,19 @@ Every cutoff spring has unit relative weight, so the global spring constant
 
 ### Voronoi Tessellation
 
-Voronoi tessellation is ElastiCrab's distinctive network option. It replaces a
+Voronoi tessellation is Elasticrab's distinctive network option. It replaces a
 distance cutoff with contact geometry.
 
-With `--voronota`, ElastiCrab calls `voronota-ltr` in process. It represents
+With `--voronota`, Elasticrab calls `voronota-ltr` in process. It represents
 each selected atom as a ball with its parsed coordinates and Voronota radius,
 then computes radical-tessellation contacts with a 1.4 Å solvent probe. Each
 returned contact contains two atom indices, `id_a` and `id_b`, and the shared
-cell-face area, $A_{ij}$. ElastiCrab creates one elastic spring for each
+cell-face area, $A_{ij}$. Elasticrab creates one elastic spring for each
 returned contact, using `id_a` and `id_b` as the spring endpoints.
 
 Contact area is a physical proxy for mechanical coupling. In a coarse elastic
 model, a broad packing interface should resist relative displacement more than a
-small grazing contact. ElastiCrab therefore uses contact area as a relative
+small grazing contact. Elasticrab therefore uses contact area as a relative
 stiffness, not as a first-principles force constant. It first computes the mean
 contact area
 
@@ -319,7 +321,7 @@ Voronoi tessellation matters in two places:
 
 ## Methodology
 
-ElastiCrab uses the Anisotropic Network Model (ANM). Each atom is a point in a
+Elasticrab uses the Anisotropic Network Model (ANM). Each atom is a point in a
 spring network. For a conformation with coordinates $\mathbf{r}$, the elastic
 spring energy is
 
@@ -365,7 +367,7 @@ trajectory writing.
 Nonlinear displacement is NOLB-inspired rigid-block extrapolation. It unweights
 the reduced translational and angular velocities as in NOLB, then applies each
 block as one rigid motion, so bonds within a block remain fixed even for large
-amplitudes. ElastiCrab rotates each block about its center of mass and then
+amplitudes. Elasticrab rotates each block about its center of mass and then
 translates it. NOLB's full nonlinear update additionally folds translation
 perpendicular to the rotation axis into a rotation about a shifted center.
 
@@ -397,7 +399,7 @@ $$
 over non-zero modes. `--b-factor-fit` uses a separate non-mass-weighted all-atom
 solve for this fit, because B-factors describe configurational fluctuations.
 It reports the fitted $\gamma$ and the Pearson correlation. If the fit fails,
-ElastiCrab warns and falls back to `--gamma`.
+Elasticrab warns and falls back to `--gamma`.
 
 ### VoroMQA Energy
 
@@ -413,7 +415,7 @@ $$
 Here $t_i$ is the atom type, $A_{ij}$ is the Voronoi contact area, $c_{ij}$ is
 the contact class, and $S_i$ is the solvent-accessible area.
 
-ElastiCrab applies the following inclusion rules:
+Elasticrab applies the following inclusion rules:
 
 - A pair contact is scored only if both atom types are present in the potential.
 - Same-chain contacts with residue-number separation 0 or 1 are skipped. These
@@ -429,12 +431,12 @@ ElastiCrab applies the following inclusion rules:
 
 The solvent term includes every atom whose type has a solvent coefficient. Atoms
 without a coefficient are skipped from both the pair and solvent terms, and the
-CLI prints a warning. If an atom has no Voronoi cell in a frame, ElastiCrab
+CLI prints a warning. If an atom has no Voronoi cell in a frame, Elasticrab
 treats it as fully exposed and uses $S_i=4\pi(r_i+1.4)^2$. Custom potential
 files must use the centrality-only classes `central_sep1`, `central_sep2`,
 `sep1`, and `sep2`; files with peripheral classes are rejected.
 
-ElastiCrab evaluates this score in process with `voronota-ltr`, not with the
+Elasticrab evaluates this score in process with `voronota-ltr`, not with the
 full Voronota executable. The bundled coefficients were derived for full
 Voronota areas, so the absolute pseudo-energy is approximate. The intended use
 is native-referenced reweighting, where a mostly systematic offset should cancel
@@ -448,13 +450,13 @@ Trajectory format is chosen from the output extension:
 - `.xtc`: XTC trajectory.
 - any other extension: PDB.
 
-If no output path is given, ElastiCrab writes beside the input structure:
+If no output path is given, Elasticrab writes beside the input structure:
 
 - `animate`: `<input>_mode1.pdb`, or one file per mode.
 - `transition`: `<input>_morph.pdb`.
 - `energy`: `<input>_modes.pdb` plus the required CSV path.
 
-ElastiCrab refuses to overwrite the input structure.
+Elasticrab refuses to overwrite the input structure.
 
 ## Validation
 
@@ -525,5 +527,5 @@ Library documentation is published at <https://docs.rs/elasticrab>.
 
 ## License
 
-ElastiCrab is licensed under Apache-2.0. Bundled ProDy fixtures and the VoroMQA
+Elasticrab is licensed under Apache-2.0. Bundled ProDy fixtures and the VoroMQA
 potential are MIT-licensed; see `tests/data/ATTRIBUTION.md`.
