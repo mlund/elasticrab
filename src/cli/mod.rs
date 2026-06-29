@@ -162,10 +162,9 @@ enum Command {
     },
 }
 
-/// Entry point: set up diagnostics, parse arguments, run, and turn any error into
-/// a clean message and a failing exit code.
+/// Entry point: parse arguments, run, and turn any error into a clean message and
+/// a failing exit code.
 pub fn run() -> ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     match execute(&Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
