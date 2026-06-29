@@ -104,8 +104,8 @@ pub fn write_nmd(
     let mut writer = BufWriter::new(file);
     let mut line = String::new();
 
-    writeln!(writer, "nmwiz_load {}", absolute_path(path).display())
-        .map_err(|e| writing(path, &e))?;
+    let nmd_path = absolute_path(path).to_string_lossy().into_owned();
+    writeln!(writer, "nmwiz_load {}", tcl_word(&nmd_path)).map_err(|e| writing(path, &e))?;
     writeln!(writer, "name {}", nmd_name(path)).map_err(|e| writing(path, &e))?;
     write_tokens(
         &mut writer,
@@ -177,6 +177,29 @@ fn absolute_path(path: &Path) -> PathBuf {
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     }
+}
+
+/// Quote a value as one Tcl word. NMD files double as Tcl scripts for VMD, so
+/// paths need escaping for spaces, brackets, `$`, and Windows backslashes.
+fn tcl_word(value: &str) -> String {
+    if value.is_empty() {
+        return "{}".to_string();
+    }
+
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' | ' ' | '"' | '$' | '[' | ']' | '{' | '}' | ';' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn nmd_name(path: &Path) -> String {
@@ -316,4 +339,19 @@ fn enclosing_box_nm(frames: &Trajectory) -> [f32; 9] {
     }
     let side = |c: usize| ((hi[c] - lo[c]) / 10.0 + 2.0) as f32; // nm, +1 nm each side
     [side(0), 0.0, 0.0, 0.0, side(1), 0.0, 0.0, 0.0, side(2)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tcl_word_escapes_loader_paths() {
+        assert_eq!(tcl_word("/tmp/modes file.nmd"), "/tmp/modes\\ file.nmd");
+        assert_eq!(
+            tcl_word("C:\\Users\\Mikael Lund\\modes[1].nmd"),
+            "C:\\\\Users\\\\Mikael\\ Lund\\\\modes\\[1\\].nmd"
+        );
+        assert_eq!(tcl_word("cost$1;safe"), "cost\\$1\\;safe");
+    }
 }

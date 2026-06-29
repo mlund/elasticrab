@@ -3,6 +3,7 @@
 //! covered by the library/golden tests; here we only pin the command grammar.
 #![cfg(feature = "cli")]
 
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_elasticrab");
@@ -23,6 +24,14 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn temp_file(name: &str, ext: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "elasticrab_cli_{name}_{}.{}",
+        std::process::id(),
+        ext
+    ))
+}
+
 #[test]
 fn animate_reports_the_spectrum() {
     let out = run(&["-i", &input(), "-n", "2", "-s", "0", "animate"]);
@@ -40,7 +49,7 @@ fn animate_reports_the_spectrum() {
 
 #[test]
 fn animate_writes_combined_nmd_when_requested() {
-    let nmd = std::env::temp_dir().join(format!("elasticrab_cli_modes_{}.nmd", std::process::id()));
+    let nmd = temp_file("modes with spaces", "nmd");
     let out = run(&[
         "-i",
         &input(),
@@ -60,7 +69,9 @@ fn animate_writes_combined_nmd_when_requested() {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = std::fs::read_to_string(&nmd).unwrap();
-    assert!(text.contains("nmwiz_load "), "{text}");
+    let first_line = text.lines().next().unwrap_or_default();
+    assert!(first_line.starts_with("nmwiz_load "), "{text}");
+    assert!(first_line.contains("\\ "), "{first_line}");
     assert!(text.contains("\ncoordinates "), "{text}");
     assert!(text.contains("\nmode 1 "), "{text}");
     assert!(text.contains("\nmode 3 "), "{text}");
@@ -144,9 +155,8 @@ fn iterative_transition_reports_the_ladder() {
 
 #[test]
 fn energy_writes_the_csv() {
-    let dir = std::env::temp_dir();
-    let csv = dir.join("elasticrab_cli_energy.csv");
-    let pdb = dir.join("elasticrab_cli_energy.pdb");
+    let csv = temp_file("energy", "csv");
+    let pdb = temp_file("energy", "pdb");
     let out = run(&[
         "-i",
         &input(),
@@ -195,34 +205,39 @@ fn missing_verb_or_required_arg_fails() {
 
 #[test]
 fn out_of_range_modes_fail_cleanly_not_panic() {
+    let csv = temp_file("out_of_range", "csv");
+    let csv = csv.to_string_lossy().into_owned();
     // -n beyond the spectrum: a clean CLI error (exit 1), never an out-of-bounds panic.
     for verb in [
         &["-i", &input(), "-n", "9999", "animate"][..],
-        &["-i", &input(), "-n", "9999", "energy", "--csv", "/dev/null"],
+        &["-i", &input(), "-n", "9999", "energy", "--csv", &csv],
     ] {
         let out = run(verb);
         assert_eq!(out.status.code(), Some(1), "{verb:?}: {}", stdout(&out));
         assert!(String::from_utf8_lossy(&out.stderr).contains("non-zero modes exist"));
     }
+    let _ = std::fs::remove_file(&csv);
 }
 
 #[test]
 fn zero_modes_are_rejected_on_every_verb() {
     let target = format!("{DATA}/crambin_hinge.pdb");
+    let csv = temp_file("zero_modes", "csv");
+    let csv = csv.to_string_lossy().into_owned();
     for verb in [
         &["-i", &input(), "-n", "0", "animate"][..],
         &["-i", &input(), "-n", "0", "transition", "--target", &target],
-        &["-i", &input(), "-n", "0", "energy", "--csv", "/dev/null"],
+        &["-i", &input(), "-n", "0", "energy", "--csv", &csv],
     ] {
         assert!(!run(verb).status.success(), "{verb:?} should reject -n 0");
     }
+    let _ = std::fs::remove_file(&csv);
 }
 
 #[test]
 fn energy_honors_mode_selection() {
-    let dir = std::env::temp_dir();
-    let csv = dir.join("elasticrab_cli_mode_sel.csv");
-    let pdb = dir.join("elasticrab_cli_mode_sel.pdb");
+    let csv = temp_file("mode_sel", "csv");
+    let pdb = temp_file("mode_sel", "pdb");
     let out = run(&[
         "-i",
         &input(),

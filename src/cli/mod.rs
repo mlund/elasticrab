@@ -778,6 +778,9 @@ fn output_path(output: Option<&Path>, input: &Path, mode: usize, multi: bool) ->
 /// relative `-o protein.pdb` is recognised as the input `protein.pdb`.
 fn same_path(a: &Path, b: &Path) -> bool {
     fn resolved(path: &Path) -> PathBuf {
+        if let Ok(path) = path.canonicalize() {
+            return path;
+        }
         let parent = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
@@ -787,7 +790,22 @@ fn same_path(a: &Path, b: &Path) -> bool {
             .canonicalize()
             .map_or_else(|_| path.to_path_buf(), |dir| dir.join(name))
     }
-    resolved(a) == resolved(b)
+    same_resolved_path(&resolved(a), &resolved(b))
+}
+
+#[cfg(windows)]
+fn same_resolved_path(a: &Path, b: &Path) -> bool {
+    path_key(a) == path_key(b)
+}
+
+#[cfg(not(windows))]
+fn same_resolved_path(a: &Path, b: &Path) -> bool {
+    a == b
+}
+
+#[cfg(windows)]
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "\\").to_lowercase()
 }
 
 fn with_stem(path: &Path, f: impl FnOnce(&str) -> String) -> PathBuf {
@@ -1270,5 +1288,20 @@ mod tests {
         assert_eq!(score.skipped, 0, "v1 should cover every crambin atom");
         assert_eq!(score.total, records.len());
         assert!(score.energy.is_finite() && score.energy != 0.0);
+    }
+
+    #[test]
+    fn same_path_resolves_existing_files() {
+        let path = Path::new("tests/data/crambin_heavy.pdb");
+        assert!(same_path(path, Path::new("tests/data/./crambin_heavy.pdb")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_path_is_case_insensitive_on_windows() {
+        assert!(same_path(
+            Path::new("tests/data/crambin_heavy.pdb"),
+            Path::new("TESTS/DATA/CRAMBIN_HEAVY.PDB")
+        ));
     }
 }

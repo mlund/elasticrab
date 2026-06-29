@@ -37,11 +37,21 @@ jobs:
       - run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
 
   test:
-    name: test (${{ matrix.features || 'default' }})
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }}, ${{ matrix.features || 'default' }})
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        features: ["", "--features sparse", "--features parallel", "--features cli"]
+        include:
+          - os: ubuntu-latest
+            features: ""
+          - os: ubuntu-latest
+            features: "--features sparse"
+          - os: ubuntu-latest
+            features: "--features parallel"
+          - os: ubuntu-latest
+            features: "--features cli"
+          - os: windows-latest
+            features: "--features cli"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
